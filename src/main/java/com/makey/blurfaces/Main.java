@@ -510,18 +510,11 @@ public final class Main {
                         && held != null) result = held;
                 boolean sameSource = result != null && source.equals(result.sourceKey);
                 boolean fresh = sameSource && now - result.captureNanos <= LOST_HEAD_HOLD_NS;
-                boolean awaitingSwitchScan = source.equals(PENDING_CAMERA_SOURCE.get());
-                // A confirmed zero-face result is safe even when the worker result
-                // arrived after the short freshness window. Previously the else
-                // branch only cleared faceCount and left emergencyCover sticky,
-                // so one startup/flip transition pixelated the whole circle forever.
-                if (awaitingSwitchScan) {
-                    // Detection is already forced by afterDraw. Keep the new source
-                    // visually intact until its head-local mask is ready; a camera
-                    // transition must never become a full-circle blur.
-                    s.faceCount = 0;
-                    s.emergencyCover = false;
-                } else if (sameSource && result.count == 0 && result.authoritative) {
+                // PENDING_CAMERA_SOURCE controls detector cadence only. In 1.8.2 it
+                // was also used as a render gate, so a valid source-bound face could
+                // be published while preview was still forced to faceCount=0. The
+                // worker's source ownership check already rejects retired results.
+                if (sameSource && result.count == 0 && result.authoritative) {
                     s.faceCount = 0;
                     s.emergencyCover = false;
                 } else if (fresh) {
