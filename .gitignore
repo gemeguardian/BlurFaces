@@ -1,0 +1,38 @@
+# Generated build outputs
+/build/
+/.gradle/
+/.cxx/
+
+# Local Android/Gradle machine configuration
+/local.properties
+
+# Python caches and virtual environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Native compiler intermediates
+*.o
+*.d
+
+# Local logs, captures, and temporary files
+*.log
+*.tmp
+*.swp
+.DS_Store
+
+# Credentials and signing material
+.env
+.env.*
+!.env.example
+*.jks
+*.keystore
+*.pem
+*.key
+*.p12
+*.pfx
+
+# IDE-local state
+.idea/
+.vscode/

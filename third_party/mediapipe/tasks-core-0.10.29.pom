@@ -1,0 +1,86 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd"
+    xmlns="http://maven.apache.org/POM/4.0.0"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.google.mediapipe</groupId>
+  <artifactId>tasks-core</artifactId>
+  <version>0.10.29</version>
+  <packaging>aar</packaging>
+  
+<name>MediaPipe Taksks Core</name>
+<description>The MediaPipe Tasks core components.</description>
+<url>https://mediapipe.dev/</url>
+<inceptionYear>2022</inceptionYear>
+
+  <licenses>
+    <license>
+      <name>The Apache Software License, Version 2.0</name>
+      <url>http://www.apache.org/licenses/LICENSE-2.0.txt</url>
+      <distribution>repo</distribution>
+    </license>
+  </licenses>
+  <developers>
+    <developer>
+      <name>The MediaPipe Authors</name>
+    </developer>
+  </developers>
+  <dependencies>
+    
+<dependency>
+  <groupId>com.google.flogger</groupId>
+  <artifactId>flogger</artifactId>
+  <version>0.6</version>
+  <scope>compile</scope>
+</dependency>
+
+
+<dependency>
+  <groupId>com.google.flogger</groupId>
+  <artifactId>flogger-system-backend</artifactId>
+  <version>0.6</version>
+  <scope>compile</scope>
+</dependency>
+
+
+<dependency>
+  <groupId>com.google.guava</groupId>
+  <artifactId>guava</artifactId>
+  <version>27.0.1-android</version>
+  <scope>compile</scope>
+</dependency>
+
+
+<dependency>
+  <groupId>com.google.protobuf</groupId>
+  <artifactId>protobuf-javalite</artifactId>
+  <version>4.26.1</version>
+  <scope>compile</scope>
+</dependency>
+
+
+<dependency>
+  <groupId>com.google.android.datatransport</groupId>
+  <artifactId>transport-api</artifactId>
+  <version>3.0.0</version>
+  <scope>compile</scope>
+</dependency>
+
+
+<dependency>
+  <groupId>com.google.android.datatransport</groupId>
+  <artifactId>transport-backend-cct</artifactId>
+  <version>3.1.0</version>
+  <scope>compile</scope>
+</dependency>
+
+
+<dependency>
+  <groupId>com.google.android.datatransport</groupId>
+  <artifactId>transport-runtime</artifactId>
+  <version>3.1.0</version>
+  <scope>compile</scope>
+</dependency>
+
+  </dependencies>
+</project>
