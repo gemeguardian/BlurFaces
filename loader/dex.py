@@ -1,7 +1,7 @@
 import base64
+import hashlib
 import os
-from java.nio import ByteBuffer
-from dalvik.system import InMemoryDexClassLoader, DexClassLoader
+from dalvik.system import DexClassLoader
 from java.lang import String
 from org.telegram.messenger import ApplicationLoader
 
@@ -21,11 +21,16 @@ class DexLoader:
         self.dex_main_class = None
         self.dex_loader = None
 
-    def load_and_start(self, so_path, param_path, bin_path, mesh_path, mesh_native_path, mesh_dex_path):
+    def load_and_start(self, model_path, native_path, runtime_dex_path):
         try:
-            # Core hook DEX stays embedded. MediaPipe is a verified remote secondary
-            # DEX, so normal users do not install several megabytes of effect code.
+            # Core hooks stay embedded. The SHA-verified MediaPipe runtime is the
+            # parent so Main resolves all task classes through one runtime loader.
             dex_bytes = base64.b64decode(EMBEDDED_DEX_BASE64)
+            actual_core_sha256 = hashlib.sha256(dex_bytes).hexdigest()
+            if actual_core_sha256 != EMBEDDED_DEX_SHA256:
+                raise ValueError(
+                    f"Embedded core DEX SHA-256 mismatch: {actual_core_sha256}"
+                )
             cache = ApplicationLoader.applicationContext.getDir(CACHE_DIR_NAME, 0)
             core_path = os.path.join(cache.getAbsolutePath(), "core.dex")
             try:
@@ -39,15 +44,13 @@ class DexLoader:
             # subsequent plugin loads where the filename is reused.
             os.chmod(core_path, 0o444)
             opt = ApplicationLoader.applicationContext.getDir(DEX_OPT_DIR_NAME, 0)
-            mesh_library_dir = os.path.dirname(mesh_native_path) if mesh_native_path else None
+            media_pipe_library_dir = os.path.dirname(native_path)
             parent = ApplicationLoader.applicationContext.getClassLoader()
-            if mesh_dex_path:
-                mesh_loader = DexClassLoader(
-                    mesh_dex_path, opt.getAbsolutePath(), mesh_library_dir, parent,
-                )
-                parent = mesh_loader
+            runtime_loader = DexClassLoader(
+                runtime_dex_path, opt.getAbsolutePath(), media_pipe_library_dir, parent,
+            )
             loader = DexClassLoader(
-                core_path, opt.getAbsolutePath(), mesh_library_dir, parent,
+                core_path, opt.getAbsolutePath(), media_pipe_library_dir, runtime_loader,
             )
             dex_class = loader.loadClass(CLASS_NAME)
             # Install the diagnostic sink before initAndStart so Java/native
@@ -58,9 +61,7 @@ class DexLoader:
             set_logger = dex_class.getMethod("setLogger", consumer_type)
             set_logger.invoke(None, logger_proxy)
             self.plugin.log("[BlurFaces] logger callback installed")
-            dex_class.getMethod(
-                "initAndStart", String, String, String, String, String
-            ).invoke(None, so_path, param_path, bin_path, mesh_path, mesh_native_path)
+            dex_class.getMethod("initAndStart", String).invoke(None, model_path)
             self.dex_loader = loader
             self.dex_main_class = dex_class
             self.plugin.log("[BlurFaces] DEX loaded and started")

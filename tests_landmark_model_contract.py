@@ -1,22 +1,32 @@
 #!/usr/bin/env python3
-"""Validate the shipped NCNN model's output layout against the native decoder."""
+"""Loader lifecycle and MediaPipe asset contracts."""
 from pathlib import Path
 
-SIZE = 320
-layout = ((8, 3), (16, 2), (32, 2), (64, 3))
-priors = sum(((SIZE + stride - 1) // stride) ** 2 * anchors for stride, anchors in layout)
-assert priors == 5875, priors
+root = Path(__file__).resolve().parent
+plugin = (root / "loader/plugin.py").read_text()
+utils = (root / "loader/utils.py").read_text()
+main = (root / "src/main/java/com/makey/blurfaces/Main.java").read_text()
+package = (root / "loader/build.py").read_text()
+model = root / "model/face_landmarker.task"
 
-param = Path("model/retinaface_mnet025_5kps.param").read_text()
-# The four endpoint reshapes prove records are 4 loc, 2 score, 10 landmarks.
-for line in (
-    "Reshape          416                      1 1 368 416 0=4 1=-1",
-    "Reshape          457                      1 1 372 457 0=2 1=-1",
-    "Reshape          498                      1 1 376 498 0=10 1=-1",
-    "Concat           output0",
-    "Concat           529",
-    "Softmax          530",
-):
-    assert line in param, line
-
-print(f"landmark model contract: PASS ({priors} priors; loc/output0, 5-KPS/529, confidence/530)")
+assert model.is_file() and model.stat().st_size > 1_000_000
+assert "if self.enabled:" in plugin
+assert "run_on_queue(lambda: self._prepare_runtime(generation))" in plugin
+assert "def _is_current(self, generation):" in plugin
+assert "generation == self._generation" in plugin
+assert "run_on_queue(self._stop_runtime)" in plugin
+assert "self._generation += 1" in plugin
+assert "GPU Face Landmarker unavailable; host camera left untouched" in main
+assert "No CPU retry is permitted" in main
+assert 'throw new IllegalStateException("GPU Face Landmarker initialization failed"' in main
+assert "active.close()" in main
+assert "input.close()" in main and "submitted.image.close()" in main
+assert "prepare_native_load_copy(native_path, cache_dir)" in plugin
+assert '"libmediapipe_tasks_vision_jni.so"' in utils
+assert '"mediapipe_load_" + uuid.uuid4().hex' in utils
+assert package.count("?sha256={sha256(") == 3
+assert 'EMBEDDED_DEX_SHA256 = "{sha256(CORE_DEX)}"' in package
+assert "MP_RUNTIME_DEX_SHA256" in package
+assert "MP_DEX_SHA256" not in package
+assert "actual_core_sha256 != EMBEDDED_DEX_SHA256" in (root / "loader/dex.py").read_text()
+print("PASS: disabled/generation lifecycle and no-fallback GPU resource contracts")

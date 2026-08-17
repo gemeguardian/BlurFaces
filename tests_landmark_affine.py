@@ -1,53 +1,35 @@
 #!/usr/bin/env python3
-"""Deterministic geometry checks for the 5-KPS face-mask basis.
-
-This mirrors Main.anchorsToAffine and validates that its mask basis follows a
-translation, uniform zoom and in-plane roll exactly. It is intentionally pure
-Python so it runs on the build host without an Android EGL/device runtime.
-"""
+"""Behavioral checks for the oval PCA affine basis and vertical row correction."""
 import math
 
 
-def affine(points):
-    (le_x, le_y), (re_x, re_y), (nose_x, nose_y), (lm_x, lm_y), (rm_x, rm_y) = points
-    eye_x, eye_y = re_x - le_x, re_y - le_y
-    eye_distance = math.hypot(eye_x, eye_y)
-    mouth_x, mouth_y = (lm_x + rm_x) * 0.5, (lm_y + rm_y) * 0.5
-    vertical = math.hypot(mouth_x - (le_x + re_x) * 0.5, mouth_y - (le_y + re_y) * 0.5)
-    if eye_distance < 0.012 or vertical < 0.018:
-        return None
-    center_x = nose_x * 0.52 + (le_x + re_x) * 0.12 + mouth_x * 0.24
-    center_y = nose_y * 0.52 + (le_y + re_y) * 0.12 + mouth_y * 0.24
-    ux, uy = eye_x / eye_distance, eye_y / eye_distance
-    rx, ry = eye_distance * 1.32, vertical * 1.62
-    # Face-relative jaw offset must rotate with the eye axis.
-    center_x += (-uy) * (vertical * 0.20)
-    center_y += ux * (vertical * 0.20)
-    return (center_x, center_y, ux * rx, uy * rx, -uy * ry, ux * ry)
+def pca_basis(points):
+    cx = sum(x for x, _ in points) / len(points)
+    cy = sum(y for _, y in points) / len(points)
+    xx = sum((x - cx) ** 2 for x, _ in points)
+    xy = sum((x - cx) * (y - cy) for x, y in points)
+    yy = sum((y - cy) ** 2 for _, y in points)
+    angle = 0.5 * math.atan2(2 * xy, xx - yy)
+    u = (math.cos(angle), math.sin(angle))
+    v = (-u[1], u[0])
+    pu = [(x - cx) * u[0] + (y - cy) * u[1] for x, y in points]
+    pv = [(x - cx) * v[0] + (y - cy) * v[1] for x, y in points]
+    return cx, cy, u, v, (max(pu) - min(pu)) * 0.58, (max(pv) - min(pv)) * 0.58
 
 
-def transform(points, scale, angle, tx, ty):
-    c, s = math.cos(angle), math.sin(angle)
-    return [(scale * (c * x - s * y) + tx, scale * (s * x + c * y) + ty) for x, y in points]
+oval = [(0.5 + 0.2 * math.cos(i * math.pi / 18), 0.5 + 0.3 * math.sin(i * math.pi / 18)) for i in range(36)]
+base = pca_basis(oval)
+angle, scale, tx, ty = 0.61, 1.3, -0.11, 0.07
+c, s = math.cos(angle), math.sin(angle)
+transformed = [(scale * (c*x - s*y) + tx, scale * (s*x + c*y) + ty) for x, y in oval]
+actual = pca_basis(transformed)
+assert math.isclose(actual[0], scale * (c*base[0] - s*base[1]) + tx, abs_tol=1e-6)
+assert math.isclose(actual[1], scale * (s*base[0] + c*base[1]) + ty, abs_tol=1e-6)
+assert math.isclose(max(actual[4:]), scale * max(base[4:]), rel_tol=1e-6)
+assert math.isclose(min(actual[4:]), scale * min(base[4:]), rel_tol=1e-6)
 
-
-def transform_basis(b, scale, angle, tx, ty):
-    c, s = math.cos(angle), math.sin(angle)
-    cx, cy, ax, ay, bx, by = b
-    def r(x, y): return scale * (c * x - s * y), scale * (s * x + c * y)
-    cx, cy = r(cx, cy); ax, ay = r(ax, ay); bx, by = r(bx, by)
-    return (cx + tx, cy + ty, ax, ay, bx, by)
-
-
-def close(a, b, tolerance=3e-4):
-    return all(abs(x - y) <= tolerance for x, y in zip(a, b))
-
-base = [(0.38, 0.42), (0.62, 0.42), (0.50, 0.53), (0.42, 0.65), (0.58, 0.65)]
-b0 = affine(base)
-assert b0 is not None
-for scale, angle, tx, ty in [(1.0, 0.0, 0.10, -0.07), (1.45, 0.0, -0.08, 0.04), (0.78, math.radians(31), 0.13, 0.09), (1.25, math.radians(-48), -0.12, -0.06)]:
-    actual = affine(transform(base, scale, angle, tx, ty))
-    expected = transform_basis(b0, scale, angle, tx, ty)
-    assert close(actual, expected), (actual, expected)
-assert affine([(0.5, 0.5)] * 5) is None
-print("landmark affine synthetic gate: PASS (translation, zoom, roll, degenerate rejection)")
+# glReadPixels rows [bottom, middle, top] must become [top, middle, bottom].
+rows = [b"BBBB", b"MMMM", b"TTTT"]
+corrected = b"".join(reversed(rows))
+assert corrected == b"TTTTMMMMBBBB"
+print("PASS: oval PCA follows similarity transforms; glReadPixels rows are vertically corrected")

@@ -1,6 +1,6 @@
 __id__ = "blur_faces"
 __name__ = "Blur Faces"
-__description__ = "Live face blur in round-camera preview and encoded video with bounded motion recovery."
+__description__ = "GPU MediaPipe face blur in round-camera preview and encoded video."
 __author__ = "@makey"
-__version__ = "1.8.8"
+__version__ = "1.9.11"
 __min_version__ = "12.5.1"
