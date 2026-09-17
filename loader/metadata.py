@@ -1,6 +1,6 @@
 __id__ = "blur_faces"
 __name__ = "Blur Faces"
-__description__ = "GPU MediaPipe face blur in round-camera preview and encoded video."
+__description__ = "On-device face protection for round-camera preview and encoded video with blur, pixelation, and solid-mask modes."
 __author__ = "@makey"
-__version__ = "1.9.11"
+__version__ = "1.9.12"
 __min_version__ = "12.5.1"

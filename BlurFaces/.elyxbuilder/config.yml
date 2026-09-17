@@ -1,0 +1,21 @@
+zipFormat: elyx
+source: BlurFaces
+buildNameUncompiled: 'blur_faces-{version}'
+buildNameCompiled: 'blur_faces-{version}-3.11'
+ignoreAll:
+- BlurFaces/.elyxbuilder/cache/*
+- builds/*
+- build/*
+- .gradle/*
+- .git/*
+- __pycache__/*
+compilationIgnore: []
+optionalAssets: []
+obfuscationConfig:
+  stripDocstrings: false
+  removeLogs: false
+  renameLocals: false
+  encodeStrings: false
+  encodeNumbers: false
+  zlibCompression: false
+  saveMapping: false

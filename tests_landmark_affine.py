@@ -33,3 +33,12 @@ rows = [b"BBBB", b"MMMM", b"TTTT"]
 corrected = b"".join(reversed(rows))
 assert corrected == b"TTTTMMMMBBBB"
 print("PASS: oval PCA follows similarity transforms; glReadPixels rows are vertically corrected")
+
+# Geometry starts at 0.78 of the full oval span, while an exact oval radius is
+# 0.5 of that span. The 65% profile therefore closely follows the landmark oval.
+precise_ratio = 0.78 * 0.65 / 0.5
+standard_ratio = 0.78 * 0.82 / 0.5
+wide_ratio = 0.78 * 1.0 / 0.5
+assert 1.0 <= precise_ratio < 1.03
+assert 1.25 < standard_ratio < 1.30
+assert math.isclose(wide_ratio, 1.56)

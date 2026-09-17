@@ -1,0 +1,5 @@
+metainfo: BlurFaces/metainfo.yml
+main: BlurFaces/main.py
+strings: BlurFaces/strings
+assets: BlurFaces/assets
+elyxbuilder: BlurFaces/.elyxbuilder

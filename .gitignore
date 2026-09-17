@@ -1,5 +1,9 @@
 # Generated build outputs
 /build/
+/builds/
+/BlurFaces/assets/dex/
+/BlurFaces/assets/jni/
+/BlurFaces/assets/model/
 /.gradle/
 /.cxx/
 

@@ -1,0 +1,9 @@
+id: blur_faces
+name: Blur Faces
+version: "2.3.0"
+author: "@gemeguardian"
+description: "{plugin_description}"
+app_version: ">=12.5.1"
+sdk_version: ">=1.4.4.3"
+dex_gen: 2
+requirements: ""

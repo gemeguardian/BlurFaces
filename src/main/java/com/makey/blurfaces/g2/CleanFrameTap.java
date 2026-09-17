@@ -1,4 +1,4 @@
-package com.makey.blurfaces;
+package com.makey.blurfaces.g2;
 
 import android.opengl.GLES20;
 
@@ -39,6 +39,10 @@ final class CleanFrameTap {
     private int blurPos, blurTex, blurSampler, blurStep;
     private boolean ready, failed;
     private String lastError = "not started";
+    private static final float[] FULL_QUAD_TEX = {0f,0f, 1f,0f, 0f,1f, 1f,1f};
+    private final float[] quad = new float[16];
+    private final FloatBuffer quadBuffer = ByteBuffer.allocateDirect(16 * 4)
+            .order(ByteOrder.nativeOrder()).asFloatBuffer();
 
     String lastError() { return lastError; }
 
@@ -87,7 +91,7 @@ final class CleanFrameTap {
                         GLES20.GL_UNSIGNED_BYTE, cleanReadback);
             }
 
-            uploadQuad(new float[]{0f,0f, 1f,0f, 0f,1f, 1f,1f});
+            uploadQuad(FULL_QUAD_TEX);
             float step = 4.5f / SIZE;
             drawBlur(textures[0], fbos[1], step, 0f);
             drawBlur(textures[1], fbos[0], 0f, step);
@@ -185,11 +189,13 @@ final class CleanFrameTap {
     }
 
     private void uploadQuad(float[] t) {
-        float[] q = {-1f,-1f,t[0],t[1], 1f,-1f,t[2],t[3], -1f,1f,t[4],t[5], 1f,1f,t[6],t[7]};
-        FloatBuffer data = ByteBuffer.allocateDirect(q.length * 4).order(ByteOrder.nativeOrder()).asFloatBuffer();
-        data.put(q).position(0);
+        quad[0] = -1f; quad[1] = -1f; quad[2] = t[0]; quad[3] = t[1];
+        quad[4] = 1f; quad[5] = -1f; quad[6] = t[2]; quad[7] = t[3];
+        quad[8] = -1f; quad[9] = 1f; quad[10] = t[4]; quad[11] = t[5];
+        quad[12] = 1f; quad[13] = 1f; quad[14] = t[6]; quad[15] = t[7];
+        quadBuffer.clear(); quadBuffer.put(quad).position(0);
         GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, vbo);
-        GLES20.glBufferData(GLES20.GL_ARRAY_BUFFER, q.length * 4, data, GLES20.GL_STREAM_DRAW);
+        GLES20.glBufferData(GLES20.GL_ARRAY_BUFFER, quad.length * 4, quadBuffer, GLES20.GL_STREAM_DRAW);
     }
 
     private int compile(int type, String source) {

@@ -1,19 +1,31 @@
-package com.makey.blurfaces;
+package com.makey.blurfaces.g2;
 
-import android.graphics.Bitmap;
 import android.graphics.SurfaceTexture;
+import android.graphics.PorterDuff;
 import android.opengl.EGL14;
 import android.opengl.GLES20;
 import android.util.Log;
+import android.view.Gravity;
+import android.view.HapticFeedbackConstants;
+import android.view.View;
+import android.view.ViewGroup;
+import android.view.ViewTreeObserver;
+import android.widget.FrameLayout;
+import android.widget.ImageView;
+import android.widget.LinearLayout;
 
-import com.google.mediapipe.framework.image.BitmapImageBuilder;
+import com.google.mediapipe.framework.image.ByteBufferImageBuilder;
 import com.google.mediapipe.framework.image.MPImage;
 import com.google.mediapipe.tasks.components.containers.NormalizedLandmark;
+import com.google.mediapipe.tasks.components.containers.Detection;
+import com.google.mediapipe.tasks.components.containers.NormalizedKeypoint;
 import com.google.mediapipe.tasks.core.BaseOptions;
 import com.google.mediapipe.tasks.core.Delegate;
 import com.google.mediapipe.tasks.vision.core.RunningMode;
 import com.google.mediapipe.tasks.vision.facelandmarker.FaceLandmarker;
 import com.google.mediapipe.tasks.vision.facelandmarker.FaceLandmarkerResult;
+import com.google.mediapipe.tasks.vision.facedetector.FaceDetector;
+import com.google.mediapipe.tasks.vision.facedetector.FaceDetectorResult;
 
 import java.io.FileInputStream;
 import java.lang.reflect.Field;
@@ -34,11 +46,16 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.Future;
 import java.util.function.Consumer;
 
 import de.robv.android.xposed.XC_MethodHook;
 import de.robv.android.xposed.XposedBridge;
+import org.telegram.messenger.AndroidUtilities;
 import org.telegram.messenger.ApplicationLoader;
+import org.telegram.messenger.R;
+import org.telegram.ui.ActionBar.Theme;
 
 /** Round-video face blur whose sole geometry source is MediaPipe Face Landmarker. */
 public final class Main {
@@ -49,10 +66,16 @@ public final class Main {
             "org.telegram.ui.Components.InstantCameraView$EncoderRenderer";
     private static final String FRAME_SNAPSHOT =
             "com.exteragram.messenger.camera.RoundVideoEncoder$FrameSnapshot";
+    private static final String SYSTEM_UTILS =
+            "com.exteragram.messenger.utils.system.SystemUtils";
     private static final int MAX_FACES = 4;
     private static final int FACE_STRIDE = 6;
     private static final long CAPTURE_INTERVAL_NS = 33_333_333L;
-    private static final long STALE_HOLD_NS = 350_000_000L;
+    private static final long TRACK_HOLD_NS = 350_000_000L;
+    private static final long MAX_TRACK_HOLD_NS = 1_200_000_000L;
+    private static final long MAX_PREDICTION_NS = 120_000_000L;
+    private static final float TRACK_SMOOTHING = 0.55f;
+    private static final long METRICS_LOG_INTERVAL_NS = 5_000_000_000L;
     private static final int GL_TEXTURE_EXTERNAL_OES = 0x8D65;
     // MediaPipe's canonical face oval. PCA makes roll stable while extrema size the mask.
     private static final int[] OVAL = {10,338,297,332,284,251,389,356,454,323,361,288,397,
@@ -63,21 +86,33 @@ public final class Main {
             Collections.synchronizedMap(new WeakHashMap<Object, CameraState>());
     private static final Map<Object, EncoderState> ENCODER_STATES =
             Collections.synchronizedMap(new WeakHashMap<Object, EncoderState>());
+    private static final Map<Object, BlurControl> BLUR_CONTROLS =
+            Collections.synchronizedMap(new WeakHashMap<Object, BlurControl>());
     private static final Map<Integer, String> SOURCE_BY_SLOT = new ConcurrentHashMap<>();
     private static final Map<Integer, String> SOURCE_BY_TEXTURE = new ConcurrentHashMap<>();
     private static final Map<String, Long> SOURCE_ACTIVE_SINCE = new ConcurrentHashMap<>();
-    private static final Map<String, FaceGeometry> RESULTS = new ConcurrentHashMap<>();
-    private static final Map<String, FaceGeometry> HELD_RESULTS = new ConcurrentHashMap<>();
+    private static final Map<String, SourceTracks> SOURCE_TRACKS = new ConcurrentHashMap<>();
     private static final AtomicReference<CapturedFrame> LATEST_FRAME = new AtomicReference<>();
-    private static final AtomicReference<SubmittedFrame> IN_FLIGHT = new AtomicReference<>();
     private static final AtomicBoolean DRAIN_SCHEDULED = new AtomicBoolean();
     private static final ArrayBlockingQueue<ByteBuffer> FRAME_POOL = new ArrayBlockingQueue<>(3);
+    private static final ConcurrentHashMap<Class<?>, ConcurrentHashMap<String, Field>> FIELD_CACHE =
+            new ConcurrentHashMap<>();
+    private static final AtomicLong RECONFIGURE_GENERATION = new AtomicLong();
 
     private static volatile boolean initialized;
     private static volatile boolean acceptingFrames;
+    private static volatile boolean blurEnabled = true;
+    private static volatile int roundVideoResolutionOverride;
+    private static volatile float faceMaskScale = 1.0f;
+    private static volatile int maskMode;
+    private static volatile String protectionState = "DISABLED";
     private static FaceLandmarker landmarker;
+    private static FaceDetector detector;
+    private static boolean liteModel;
     private static ExecutorService frameExecutor;
     private static long lastTimestampMs;
+    private static long lastMetricsLogNanos;
+    private static long framesCaptured, framesProcessed, framesDropped, inferenceNanos;
     private static Consumer<String> logger;
 
     private static final String VS =
@@ -88,32 +123,63 @@ public final class Main {
             "#extension GL_OES_EGL_image_external : require\nprecision mediump float;" +
             "varying vec2 vTextureCoord;uniform samplerExternalOES sTexture;uniform sampler2D sBlurTexture;" +
             "uniform vec2 uFaceCenter[" + MAX_FACES + "];uniform vec2 uFaceAxisX[" + MAX_FACES + "];" +
-            "uniform vec2 uFaceAxisY[" + MAX_FACES + "];uniform int uFaceCount;uniform vec2 uViewport;" +
+            "uniform vec2 uFaceAxisY[" + MAX_FACES + "];uniform int uFaceCount;uniform vec2 uViewport;uniform float uMaskScale;uniform int uMaskMode;" +
             "vec2 buv(){return clamp(gl_FragCoord.xy/uViewport,0.0,1.0);}" +
             "void main(){vec4 src=texture2D(sTexture,vTextureCoord);if(uViewport.x<1.0){gl_FragColor=src;return;}" +
             "if(uFaceCount<0){gl_FragColor=texture2D(sBlurTexture,buv());return;}if(uFaceCount==0){gl_FragColor=src;return;}" +
             "vec2 p=vec2(gl_FragCoord.x/uViewport.x,1.0-gl_FragCoord.y/uViewport.y);float m=0.0;" +
             "for(int i=0;i<" + MAX_FACES + ";++i){if(i>=uFaceCount)break;vec2 d=p-uFaceCenter[i];vec2 x=uFaceAxisX[i],y=uFaceAxisY[i];" +
-            "float z=x.x*y.y-x.y*y.x;if(abs(z)<.000001)continue;vec2 l=vec2((d.x*y.y-d.y*y.x)/z,(-d.x*x.y+d.y*x.x)/z);" +
-            "m=max(m,1.0-smoothstep(.82,1.0,length(l)));}if(m<=0.0){gl_FragColor=src;return;}" +
-            "gl_FragColor=mix(src,texture2D(sBlurTexture,buv()),m);}";
+             "float z=x.x*y.y-x.y*y.x;if(abs(z)<.000001)continue;vec2 l=vec2((d.x*y.y-d.y*y.x)/z,(-d.x*x.y+d.y*x.x)/z);" +
+             "float q=sqrt(max(dot(l,l),0.0))/max(uMaskScale,.1);m=max(m,clamp(1.0-smoothstep(.84,1.04,q),0.0,1.0));}if(m<=0.0){gl_FragColor=src;return;}" +
+            "vec2 uv=buv();if(uMaskMode==1)uv=(floor(uv*32.0)+.5)/32.0;vec4 protectedColor=uMaskMode==2?vec4(.03,.03,.03,1.0):texture2D(sBlurTexture,uv);gl_FragColor=mix(src,protectedColor,m);}";
     private static final String ENCODER_FS =
             "#extension GL_OES_EGL_image_external : require\nprecision highp float;varying vec2 vTextureCoord;" +
             "uniform samplerExternalOES sTexture;uniform sampler2D sBlurTexture;uniform vec2 preview;uniform vec2 resolution;uniform float alpha;uniform vec2 texelSize;" +
             "uniform vec2 uFaceCenter[" + MAX_FACES + "];uniform vec2 uFaceAxisX[" + MAX_FACES + "];" +
-            "uniform vec2 uFaceAxisY[" + MAX_FACES + "];uniform int uFaceCount;uniform vec2 uViewport;" +
+            "uniform vec2 uFaceAxisY[" + MAX_FACES + "];uniform int uFaceCount;uniform vec2 uViewport;uniform float uMaskScale;uniform int uMaskMode;" +
             "vec2 buv(){return clamp(gl_FragCoord.xy/uViewport,0.0,1.0);}" +
             "void main(){vec4 src=texture2D(sTexture,vTextureCoord);if(uViewport.x<1.0){gl_FragColor=vec4(src.rgb*alpha,alpha);return;}" +
             "if(uFaceCount<0){vec4 o=texture2D(sBlurTexture,buv());gl_FragColor=vec4(o.rgb*alpha,alpha);return;}" +
             "if(uFaceCount==0){gl_FragColor=vec4(src.rgb*alpha,alpha);return;}" +
             "vec2 p=vec2(gl_FragCoord.x/uViewport.x,1.0-gl_FragCoord.y/uViewport.y);float m=0.0;" +
             "for(int i=0;i<" + MAX_FACES + ";++i){if(i>=uFaceCount)break;vec2 d=p-uFaceCenter[i];vec2 x=uFaceAxisX[i],y=uFaceAxisY[i];" +
-            "float z=x.x*y.y-x.y*y.x;if(abs(z)<.000001)continue;vec2 l=vec2((d.x*y.y-d.y*y.x)/z,(-d.x*x.y+d.y*x.x)/z);" +
-            "m=max(m,1.0-smoothstep(.82,1.0,length(l)));}if(m<=0.0){gl_FragColor=vec4(src.rgb*alpha,alpha);return;}" +
-            "vec4 o=mix(src,texture2D(sBlurTexture,buv()),m);gl_FragColor=vec4(o.rgb*alpha,alpha);}";
+             "float z=x.x*y.y-x.y*y.x;if(abs(z)<.000001)continue;vec2 l=vec2((d.x*y.y-d.y*y.x)/z,(-d.x*x.y+d.y*x.x)/z);" +
+             "float q=sqrt(max(dot(l,l),0.0))/max(uMaskScale,.1);m=max(m,clamp(1.0-smoothstep(.84,1.04,q),0.0,1.0));}if(m<=0.0){gl_FragColor=vec4(src.rgb*alpha,alpha);return;}" +
+            "vec2 uv=buv();if(uMaskMode==1)uv=(floor(uv*32.0)+.5)/32.0;vec4 protectedColor=uMaskMode==2?vec4(.03,.03,.03,1.0):texture2D(sBlurTexture,uv);vec4 o=mix(src,protectedColor,m);gl_FragColor=vec4(o.rgb*alpha,alpha);}";
 
     private Main() { }
     public static void setLogger(Consumer<String> value) { logger = value; }
+    public static void clearLogger() { logger = null; }
+    public static void setRoundVideoResolution(String value) {
+        int parsed;
+        try { parsed = Integer.parseInt(value); }
+        catch (Throwable ignored) { parsed = 0; }
+        if (parsed != 0 && parsed != 320 && parsed != 384 && parsed != 448 && parsed != 512) parsed = 0;
+        roundVideoResolutionOverride = parsed;
+        emit(parsed == 0 ? "Round-video resolution follows exteraGram"
+                : "Round-video resolution set to " + parsed + "x" + parsed);
+    }
+    public static void setFaceMaskScale(String value) {
+        int parsed;
+        try { parsed = Integer.parseInt(value); }
+        catch (Throwable ignored) { parsed = 100; }
+        if (parsed != 65 && parsed != 82 && parsed != 100) parsed = 82;
+        faceMaskScale = parsed / 100.0f;
+        emit("Face mask scale set to " + parsed + "%");
+    }
+    public static void setMaskMode(String value) {
+        int parsed;
+        try { parsed = Integer.parseInt(value); } catch (Throwable ignored) { parsed = 0; }
+        maskMode = parsed == 1 || parsed == 2 ? parsed : 0;
+        emit("Mask mode set to " + (maskMode == 1 ? "pixelate" : maskMode == 2 ? "solid" : "blur"));
+    }
+    public static String getProtectionState() { return protectionState; }
+    public static String getDiagnostics() {
+        long processed = framesProcessed;
+        long average = processed == 0 ? 0 : inferenceNanos / processed / 1_000_000L;
+        return "state=" + protectionState + ", captured=" + framesCaptured + ", processed=" + processed
+                + ", dropped=" + framesDropped + ", inferenceMs=" + average;
+    }
     private static void emit(String message) {
         Log.i(TAG, message);
         if (logger != null) try { logger.accept("[BlurFaces] " + message); } catch (Throwable ignored) { }
@@ -123,42 +189,169 @@ public final class Main {
         if (logger != null) try { logger.accept("[BlurFaces] " + message + ": " + error); } catch (Throwable ignored) { }
     }
 
-    public static synchronized void initAndStart(String modelPath) {
+    public static synchronized void initAndStart(String modelPath, String confidenceValue,
+                                                  String processorValue, String modelValue) {
         if (initialized) return;
         try {
-            landmarker = createGpuLandmarker(modelPath);
+            float confidence = parseDetectionConfidence(confidenceValue);
+            boolean useGpu = !"cpu".equals(processorValue);
+            liteModel = !"precise".equals(modelValue);
             startFrameExecutor();
+            Future<?> created = frameExecutor.submit(() -> {
+                try {
+                    if (liteModel) detector = createDetector(modelPath, confidence, useGpu);
+                    else landmarker = createLandmarker(modelPath, confidence, useGpu);
+                } catch (Exception error) {
+                    throw new IllegalStateException("Selected model initialization failed", error);
+                }
+            });
+            created.get(15, TimeUnit.SECONDS);
+            hookRoundVideoResolution();
+            hookCameraControls();
             hookSurfaceUpdates();
             hookCameraRenderer();
             hookEncoderRenderer();
             acceptingFrames = true;
             initialized = true;
-            emit("MediaPipe Face Landmarker 0.10.29 armed with GPU + LIVE_STREAM");
+            protectionState = "ACTIVE";
+            emit("MediaPipe " + (liteModel ? modelValue + "-range Face Detector" : "Face Landmarker")
+                    + " 0.10.29 armed with "
+                    + (useGpu ? "GPU" : "CPU") + " + VIDEO on one worker");
         } catch (Throwable error) {
-            emit("GPU Face Landmarker unavailable; host camera left untouched", error);
+            protectionState = "FAILED";
+            emit("Face Landmarker unavailable; host camera left untouched", error);
             onUnload();
-            throw new IllegalStateException("GPU Face Landmarker initialization failed", error);
+            throw new IllegalStateException("Face Landmarker initialization failed", error);
         }
     }
 
-    private static FaceLandmarker createGpuLandmarker(String modelPath) throws Exception {
+    public static boolean reconfigure(String modelPath, String confidenceValue,
+                                      String processorValue, String modelValue,
+                                      String generationValue) {
+        if (!initialized || frameExecutor == null) throw new IllegalStateException("Runtime is not active");
+        final long requestGeneration;
+        try { requestGeneration = Long.parseLong(generationValue); }
+        catch (Throwable ignored) { throw new IllegalArgumentException("Invalid reconfigure generation"); }
+        for (;;) {
+            long previous = RECONFIGURE_GENERATION.get();
+            if (requestGeneration < previous) return false;
+            if (RECONFIGURE_GENERATION.compareAndSet(previous, requestGeneration)) break;
+        }
+        float confidence = parseDetectionConfidence(confidenceValue);
+        boolean useGpu = !"cpu".equals(processorValue);
+        boolean nextLite = !"precise".equals(modelValue);
+        ExecutorService executor = frameExecutor;
+        Future<EngineCandidate> created = executor.submit(() -> {
+            if (requestGeneration != RECONFIGURE_GENERATION.get()) return null;
+            return createEngineCandidate(modelPath, confidence, useGpu, nextLite);
+        });
+        EngineCandidate candidate = null;
+        try {
+            candidate = created.get(15, TimeUnit.SECONDS);
+            if (candidate == null) return false;
+            synchronized (Main.class) {
+                if (!initialized || requestGeneration != RECONFIGURE_GENERATION.get()) {
+                    candidate.close();
+                    return false;
+                }
+                acceptingFrames = false;
+                CapturedFrame queued = LATEST_FRAME.getAndSet(null);
+                if (queued != null) FRAME_POOL.offer(queued.rgba);
+                FaceLandmarker oldLandmarker = landmarker;
+                FaceDetector oldDetector = detector;
+                landmarker = candidate.landmarker;
+                detector = candidate.detector;
+                candidate.committed = true;
+                liteModel = nextLite;
+                SOURCE_TRACKS.clear();
+                acceptingFrames = true;
+                executor.execute(() -> closeEngines(oldLandmarker, oldDetector));
+            }
+            emit("Active model switched to " + (nextLite ? modelValue + "-range Face Detector" : "Face Landmarker"));
+            return true;
+        } catch (Throwable error) {
+            if (candidate != null) candidate.close();
+            if (initialized) acceptingFrames = true;
+            emit("Model switch failed", error);
+            throw new IllegalStateException("Model switch failed", error);
+        }
+    }
+
+    public static boolean switchModel(String modelPath, String confidenceValue,
+                                      String processorValue, String modelValue) {
+        return reconfigure(modelPath, confidenceValue, processorValue, modelValue,
+                Long.toString(RECONFIGURE_GENERATION.incrementAndGet()));
+    }
+
+    private static EngineCandidate createEngineCandidate(String modelPath, float confidence,
+                                                          boolean useGpu, boolean lite) throws Exception {
+        return lite ? new EngineCandidate(null, createDetector(modelPath, confidence, useGpu))
+                : new EngineCandidate(createLandmarker(modelPath, confidence, useGpu), null);
+    }
+
+    private static void closeEngines(FaceLandmarker oldLandmarker, FaceDetector oldDetector) {
+        try { if (oldLandmarker != null) oldLandmarker.close(); }
+        catch (Throwable error) { emit("Old FaceLandmarker close failed", error); }
+        try { if (oldDetector != null) oldDetector.close(); }
+        catch (Throwable error) { emit("Old FaceDetector close failed", error); }
+    }
+
+    private static float parseDetectionConfidence(String value) {
+        int parsed;
+        try { parsed = Integer.parseInt(value); }
+        catch (Throwable ignored) { parsed = 60; }
+        if (parsed != 40 && parsed != 50 && parsed != 60) parsed = 60;
+        return parsed / 100.0f;
+    }
+
+    private static void hookRoundVideoResolution() {
+        try {
+            Class<?> type = Class.forName(SYSTEM_UTILS, false, Main.class.getClassLoader());
+            Method method = type.getDeclaredMethod("getRoundVideoResolution");
+            method.setAccessible(true);
+            HOOKS.add(XposedBridge.hookMethod(method, new XC_MethodHook() {
+                @Override public void beforeHookedMethod(MethodHookParam param) {
+                    int override = roundVideoResolutionOverride;
+                    if (override != 0) param.setResult(override);
+                }
+            }));
+            emit("Round-video resolution control ready");
+        } catch (Throwable error) {
+            emit("Round-video resolution control unavailable; exteraGram default remains active", error);
+        }
+    }
+
+    private static FaceLandmarker createLandmarker(String modelPath, float confidence,
+                                                    boolean useGpu) throws Exception {
         try (FileInputStream stream = new FileInputStream(modelPath);
              FileChannel channel = stream.getChannel()) {
             ByteBuffer model = channel.map(FileChannel.MapMode.READ_ONLY, 0, channel.size());
             BaseOptions base = BaseOptions.builder().setModelAssetBuffer(model)
-                    .setDelegate(Delegate.GPU).build();
+                    .setDelegate(useGpu ? Delegate.GPU : Delegate.CPU).build();
             FaceLandmarker.FaceLandmarkerOptions options = FaceLandmarker.FaceLandmarkerOptions.builder()
                     .setBaseOptions(base)
-                    .setRunningMode(RunningMode.LIVE_STREAM)
+                     .setRunningMode(RunningMode.VIDEO)
                     .setNumFaces(MAX_FACES)
-                    .setMinFaceDetectionConfidence(0.60f)
-                    .setMinFacePresenceConfidence(0.60f)
-                    .setMinTrackingConfidence(0.60f)
-                    .setResultListener(Main::onLandmarkerResult)
-                    .setErrorListener(Main::onLandmarkerError)
+                     .setMinFaceDetectionConfidence(confidence)
+                     .setMinFacePresenceConfidence(confidence)
+                     .setMinTrackingConfidence(0.50f)
                     .build();
-            // No CPU retry is permitted: failure here occurs before any host hook.
+            // The selected delegate is explicit; never switch modes silently.
             return FaceLandmarker.createFromOptions(ApplicationLoader.applicationContext, options);
+        }
+    }
+
+    private static FaceDetector createDetector(String modelPath, float confidence,
+                                                boolean useGpu) throws Exception {
+        try (FileInputStream stream = new FileInputStream(modelPath);
+             FileChannel channel = stream.getChannel()) {
+            ByteBuffer model = channel.map(FileChannel.MapMode.READ_ONLY, 0, channel.size());
+            BaseOptions base = BaseOptions.builder().setModelAssetBuffer(model)
+                    .setDelegate(useGpu ? Delegate.GPU : Delegate.CPU).build();
+            FaceDetector.FaceDetectorOptions options = FaceDetector.FaceDetectorOptions.builder()
+                    .setBaseOptions(base).setRunningMode(RunningMode.VIDEO)
+                    .setMinDetectionConfidence(confidence).setMinSuppressionThreshold(.30f).build();
+            return FaceDetector.createFromOptions(ApplicationLoader.applicationContext, options);
         }
     }
 
@@ -170,6 +363,78 @@ public final class Main {
             }
         }));
         emit("Hook registered: after SurfaceTexture.updateTexImage (exact CameraGLThread identity filter)");
+    }
+
+    private static void hookCameraControls() throws Exception {
+        Class<?> type = Class.forName(
+                "org.telegram.ui.Components.InstantCameraView", false, Main.class.getClassLoader());
+        HOOKS.addAll(XposedBridge.hookAllConstructors(type, new XC_MethodHook() {
+            @Override public void afterHookedMethod(MethodHookParam param) {
+                installBlurControl(param.thisObject);
+            }
+        }));
+        Method startAnimation = type.getDeclaredMethod("startAnimation", boolean.class, boolean.class);
+        startAnimation.setAccessible(true);
+        HOOKS.add(XposedBridge.hookMethod(startAnimation, new XC_MethodHook() {
+            @Override public void beforeHookedMethod(MethodHookParam param) {
+                if (Boolean.TRUE.equals(param.args[0])) installBlurControl(param.thisObject);
+            }
+        }));
+        emit("Round-camera blur toggle ready");
+    }
+
+    private static void installBlurControl(Object cameraView) {
+        try {
+            synchronized (BLUR_CONTROLS) {
+                BlurControl existing = BLUR_CONTROLS.get(cameraView);
+                if (existing != null) {
+                    existing.attach();
+                    existing.update();
+                    return;
+                }
+            }
+            if (!(cameraView instanceof FrameLayout)) return;
+            Method getZoomSlider = cameraView.getClass().getMethod("getZoomSlider");
+            View zoomSlider = (View) getZoomSlider.invoke(cameraView);
+            Theme.ResourcesProvider resourcesProvider =
+                    (Theme.ResourcesProvider) field(cameraView.getClass(), "resourcesProvider").get(cameraView);
+            BlurControl control = new BlurControl(
+                    (FrameLayout) cameraView, zoomSlider, resourcesProvider);
+            synchronized (BLUR_CONTROLS) { BLUR_CONTROLS.put(cameraView, control); }
+            // Privacy-first default for every newly opened round camera.
+            setBlurEnabled(true);
+            control.attach();
+            refreshBlurControls();
+        } catch (Throwable error) {
+            emit("Round-camera blur toggle unavailable", error);
+        }
+    }
+
+    private static void setBlurEnabled(boolean enabled) {
+        if (blurEnabled == enabled) {
+            refreshBlurControls();
+            return;
+        }
+        blurEnabled = enabled;
+        protectionState = enabled ? (initialized ? "ACTIVE" : "STARTING") : "DISABLED";
+        CapturedFrame queued = LATEST_FRAME.getAndSet(null);
+        if (queued != null) FRAME_POOL.offer(queued.rgba);
+        SOURCE_TRACKS.clear();
+        SOURCE_ACTIVE_SINCE.clear();
+        synchronized (CAMERA_STATES) {
+            for (CameraState state : CAMERA_STATES.values()) state.activeSource = null;
+        }
+        refreshBlurControls();
+        emit(enabled ? "Face blur enabled from camera controls"
+                : "Face blur disabled from camera controls");
+    }
+
+    private static void refreshBlurControls() {
+        AndroidUtilities.runOnUIThread(() -> {
+            synchronized (BLUR_CONTROLS) {
+                for (BlurControl control : BLUR_CONTROLS.values()) control.update();
+            }
+        });
     }
 
     private static void hookCameraRenderer() throws Exception {
@@ -215,7 +480,7 @@ public final class Main {
     }
 
     private static void beforePreviewDraw(Object thread) {
-        if (!acceptingFrames) return;
+        if (!acceptingFrames || !blurEnabled) return;
         CameraState state = cameraState(thread);
         try {
             if (EGL14.eglGetCurrentContext() == EGL14.EGL_NO_CONTEXT) return;
@@ -228,7 +493,7 @@ public final class Main {
             state.faceCount = geometry == null ? (hasFreshResult(source, now) ? 0 : -1) : geometry.count;
             if (geometry != null) System.arraycopy(geometry.faces, 0, state.faces, 0, geometry.count * FACE_STRIDE);
             uploadGeometry(state.program, state.faceCount, state.faces, state.center, state.axisX,
-                    state.axisY, state.viewport, state.blurSampler);
+                    state.axisY, state.viewport, state.blurSampler, state.geometryScratch);
             if (state.blurTexture != 0) bindPreviewBlur(state);
 
             Class<?> type = thread.getClass();
@@ -254,24 +519,23 @@ public final class Main {
 
     private static void bindPreviewBlur(CameraState state) {
         if (state.blurTexture == 0) return;
-        int[] active = new int[1], binding = new int[1];
-        GLES20.glGetIntegerv(GLES20.GL_ACTIVE_TEXTURE, active, 0);
+        GLES20.glGetIntegerv(GLES20.GL_ACTIVE_TEXTURE, state.glActive, 0);
         GLES20.glActiveTexture(GLES20.GL_TEXTURE1);
         if (!state.blurBindingActive) {
-            GLES20.glGetIntegerv(GLES20.GL_TEXTURE_BINDING_2D, binding, 0);
-            state.savedBlurBinding = binding[0];
+            GLES20.glGetIntegerv(GLES20.GL_TEXTURE_BINDING_2D, state.glBinding, 0);
+            state.savedBlurBinding = state.glBinding[0];
             state.blurBindingActive = true;
         }
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, state.blurTexture);
-        GLES20.glActiveTexture(active[0]);
+        GLES20.glActiveTexture(state.glActive[0]);
     }
 
     private static void restorePreviewBlur(CameraState state) {
         if (!state.blurBindingActive) return;
-        int[] active = new int[1]; GLES20.glGetIntegerv(GLES20.GL_ACTIVE_TEXTURE, active, 0);
+        GLES20.glGetIntegerv(GLES20.GL_ACTIVE_TEXTURE, state.glActive, 0);
         GLES20.glActiveTexture(GLES20.GL_TEXTURE1);
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, state.savedBlurBinding);
-        GLES20.glActiveTexture(active[0]);
+        GLES20.glActiveTexture(state.glActive[0]);
         state.blurBindingActive = false;
     }
 
@@ -289,7 +553,8 @@ public final class Main {
     }
 
     private static void afterSurfaceUpdate(SurfaceTexture updated) {
-        if (!acceptingFrames || EGL14.eglGetCurrentContext() == EGL14.EGL_NO_CONTEXT) return;
+        if (!acceptingFrames || !blurEnabled
+                || EGL14.eglGetCurrentContext() == EGL14.EGL_NO_CONTEXT) return;
         Object owner = null;
         int slot = -1;
         synchronized (CAMERA_STATES) {
@@ -328,7 +593,8 @@ public final class Main {
                     || textures == null || slot >= textures.length || textures[slot] <= 0) return;
             float[] st = new float[16]; surface.getTransformMatrix(st);
             float[] tex = new float[8]; hostTexture.position(0); hostTexture.get(tex);
-            if (now - state.lastCaptureNanos >= CAPTURE_INTERVAL_NS) frameBuffer = FRAME_POOL.poll();
+            if (!DRAIN_SCHEDULED.get() && now - state.lastCaptureNanos >= state.captureIntervalNanos)
+                frameBuffer = FRAME_POOL.poll();
             if (frameBuffer != null && state.readPixels == null) state.readPixels = ByteBuffer.allocateDirect(
                     CleanFrameTap.SIZE * CleanFrameTap.SIZE * 4).order(ByteOrder.nativeOrder());
             state.blurTexture = state.tap.renderBlur(textures[slot], mvp, st, tex,
@@ -345,18 +611,23 @@ public final class Main {
             SOURCE_BY_SLOT.put(slot, source);
             SOURCE_BY_TEXTURE.put(textures[slot], source);
             if (frameBuffer != null) {
+                framesCaptured++;
                 frameBuffer.clear();
                 copyVerticallyCorrected(state.readPixels, frameBuffer, CleanFrameTap.SIZE, CleanFrameTap.SIZE);
                 frameBuffer.position(0);
                 CapturedFrame next = new CapturedFrame(frameBuffer, now, nextTimestampMs(now), source);
                 frameBuffer = null;
                 CapturedFrame old = LATEST_FRAME.getAndSet(next);
-                if (old != null) FRAME_POOL.offer(old.rgba);
+                if (old != null) { framesDropped++; FRAME_POOL.offer(old.rgba); }
                 state.lastCaptureNanos = now;
+                state.captureIntervalNanos = Math.max(CAPTURE_INTERVAL_NS,
+                        Math.min(100_000_000L, state.captureIntervalNanos - 2_000_000L));
                 scheduleDrain();
             }
         } catch (Throwable error) {
             if (frameBuffer != null) FRAME_POOL.offer(frameBuffer);
+            state.captureIntervalNanos = Math.min(100_000_000L,
+                    Math.max(CAPTURE_INTERVAL_NS, state.captureIntervalNanos + 10_000_000L));
             emit("Preview blur generation failed for this frame", error);
         }
     }
@@ -387,70 +658,73 @@ public final class Main {
 
     private static void scheduleDrain() {
         ExecutorService executor = frameExecutor;
-        if (executor == null || executor.isShutdown() || IN_FLIGHT.get() != null
-                || !DRAIN_SCHEDULED.compareAndSet(false, true)) return;
+        if (executor == null || executor.isShutdown() || !DRAIN_SCHEDULED.compareAndSet(false, true)) return;
         try { executor.execute(Main::submitLatestFrame); }
         catch (Throwable ignored) { DRAIN_SCHEDULED.set(false); }
     }
 
     private static void submitLatestFrame() {
-        DRAIN_SCHEDULED.set(false);
-        if (!acceptingFrames || IN_FLIGHT.get() != null) return;
         CapturedFrame frame = LATEST_FRAME.getAndSet(null);
-        if (frame == null) return;
-        Bitmap bitmap = null;
+        if (frame == null) { DRAIN_SCHEDULED.set(false); return; }
         MPImage image = null;
-        boolean bufferReturned = false;
         try {
-            bitmap = Bitmap.createBitmap(CleanFrameTap.SIZE, CleanFrameTap.SIZE, Bitmap.Config.ARGB_8888);
-            frame.rgba.position(0); bitmap.copyPixelsFromBuffer(frame.rgba);
-            image = new BitmapImageBuilder(bitmap).build();
-            FRAME_POOL.offer(frame.rgba);
-            bufferReturned = true;
-            SubmittedFrame submitted = new SubmittedFrame(frame.captureNanos, frame.timestampMs,
-                    frame.sourceKey, bitmap, image);
-            if (!IN_FLIGHT.compareAndSet(null, submitted)) throw new IllegalStateException("in-flight race");
-            landmarker.detectAsync(image, frame.timestampMs);
+            long inferenceStart = System.nanoTime();
+            frame.rgba.position(0);
+            image = new ByteBufferImageBuilder(frame.rgba, CleanFrameTap.SIZE, CleanFrameTap.SIZE,
+                    MPImage.IMAGE_FORMAT_RGBA).build();
+            FaceGeometry detections;
+            if (liteModel) {
+                FaceDetectorResult result = detector.detectForVideo(image, frame.timestampMs);
+                detections = boxesToGeometry(result.detections(), frame.captureNanos, frame.sourceKey);
+            } else {
+                FaceLandmarkerResult result = landmarker.detectForVideo(image, frame.timestampMs);
+                detections = meshToGeometry(result.faceLandmarks(), frame.captureNanos, frame.sourceKey);
+            }
+            if (isSourceActive(frame.sourceKey)) {
+                updateTracks(frame.sourceKey, detections);
+                framesProcessed++;
+                inferenceNanos += System.nanoTime() - inferenceStart;
+                maybeLogMetrics();
+            } else emit("Dropped late MediaPipe result from retired source=" + frame.sourceKey);
         } catch (Throwable error) {
-            if (!bufferReturned) FRAME_POOL.offer(frame.rgba);
+            emit("MediaPipe VIDEO frame failed", error);
+        } finally {
             if (image != null) image.close();
-            if (bitmap != null) bitmap.recycle();
-            IN_FLIGHT.set(null);
-            emit("MediaPipe submission failed", error);
-            scheduleDrain();
+            FRAME_POOL.offer(frame.rgba);
+            DRAIN_SCHEDULED.set(false);
+            if (acceptingFrames && LATEST_FRAME.get() != null) scheduleDrain();
         }
     }
 
-    private static void onLandmarkerResult(FaceLandmarkerResult result, MPImage input) {
-        SubmittedFrame submitted = IN_FLIGHT.getAndSet(null);
-        try {
-            if (submitted == null || result.timestampMs() != submitted.timestampMs) return;
-            if (!isSourceActive(submitted.sourceKey)) {
-                emit("Dropped late MediaPipe result from retired source=" + submitted.sourceKey);
-                return;
+    private static FaceGeometry boxesToGeometry(List<Detection> faces, long captureNanos,
+                                                 String source) {
+        float[] output = new float[MAX_FACES * FACE_STRIDE];
+        int count = 0;
+        for (Detection face : faces) {
+            if (count >= MAX_FACES) break;
+            android.graphics.RectF box = face.boundingBox();
+            float cx = box.centerX() / CleanFrameTap.SIZE;
+            float cy = box.centerY() / CleanFrameTap.SIZE;
+            // BlazeFace boxes are intentionally expanded: unlike the landmark
+            // path they have no dense contour, and slower devices need movement
+            // margin between detector results.
+            float halfWidth = box.width() * 1.50f / (2f * CleanFrameTap.SIZE);
+            float halfHeight = box.height() * 1.65f / (2f * CleanFrameTap.SIZE);
+            float ux = 1f, uy = 0f;
+            if (face.keypoints().isPresent() && face.keypoints().get().size() >= 2) {
+                NormalizedKeypoint left = face.keypoints().get().get(0);
+                NormalizedKeypoint right = face.keypoints().get().get(1);
+                float dx = right.x() - left.x(), dy = right.y() - left.y();
+                float length = (float) Math.hypot(dx, dy);
+                if (length > .001f) { ux = dx / length; uy = dy / length; }
             }
-            FaceGeometry geometry = meshToGeometry(result.faceLandmarks(), submitted.captureNanos, submitted.sourceKey);
-            RESULTS.put(submitted.sourceKey, geometry);
-            if (geometry.count > 0) HELD_RESULTS.put(submitted.sourceKey, geometry);
-        } catch (Throwable error) { emit("MediaPipe result rejected", error); }
-        finally {
-            if (input != null) input.close();
-            if (submitted != null) {
-                if (submitted.image != input) submitted.image.close();
-                submitted.bitmap.recycle();
-            }
-            scheduleDrain();
+            int offset = count * FACE_STRIDE;
+            output[offset] = cx; output[offset + 1] = cy;
+            output[offset + 2] = ux * halfWidth; output[offset + 3] = uy * halfWidth;
+            output[offset + 4] = -uy * halfHeight; output[offset + 5] = ux * halfHeight;
+            count++;
         }
-    }
-
-    private static void onLandmarkerError(RuntimeException error) {
-        SubmittedFrame submitted = IN_FLIGHT.getAndSet(null);
-        if (submitted != null) {
-            submitted.image.close();
-            submitted.bitmap.recycle();
-        }
-        emit("MediaPipe LIVE_STREAM error", error);
-        scheduleDrain();
+        return new FaceGeometry(output, count, captureNanos, source);
     }
 
     private static FaceGeometry meshToGeometry(List<List<NormalizedLandmark>> faces,
@@ -484,10 +758,14 @@ public final class Main {
             minU = Math.min(minU, u); maxU = Math.max(maxU, u);
             minV = Math.min(minV, v); maxV = Math.max(maxV, v);
         }
-        // Keep the detected oval inside the fully blurred core; feather only
-        // outside the face so contour pixels never blend back to the original.
-        float radiusU = (maxU - minU) * 0.68f, radiusV = (maxV - minV) * 0.68f;
-        if (!Float.isFinite(cx) || !Float.isFinite(cy) || radiusU < .025f || radiusV < .025f) return false;
+        float rawU = (maxU - minU) * .5f, rawV = (maxV - minV) * .5f;
+        if (!Float.isFinite(cx) || !Float.isFinite(cy) || rawU < .008f || rawV < .008f) return false;
+        // Expand beyond the mesh oval and add a small edge allowance. If the
+        // mesh is tiny, scale both axes together so its aspect ratio is retained.
+        float radiusU = (maxU - minU) * .78f + .004f;
+        float radiusV = (maxV - minV) * .78f + .004f;
+        float safeScale = Math.max(1f, .022f / Math.min(radiusU, radiusV));
+        radiusU *= safeScale; radiusV *= safeScale;
         cx += ux * (maxU + minU) * .5f + vx * (maxV + minV) * .5f;
         cy += uy * (maxU + minU) * .5f + vy * (maxV + minV) * .5f;
         out[offset] = cx; out[offset + 1] = cy;
@@ -500,20 +778,19 @@ public final class Main {
         if (source == null || source.isEmpty()) return null;
         Long activeSince = SOURCE_ACTIVE_SINCE.get(source);
         if (activeSince == null) return null;
-        FaceGeometry current = RESULTS.get(source);
-        if (current != null && current.captureNanos >= activeSince && current.count > 0
-                && now - current.captureNanos <= STALE_HOLD_NS) return current;
-        FaceGeometry held = HELD_RESULTS.get(source);
-        return held != null && held.captureNanos >= activeSince && now - held.captureNanos <= STALE_HOLD_NS
-                ? held : null;
+        SourceTracks tracks = SOURCE_TRACKS.get(source);
+        if (tracks == null || tracks.lastResultNanos < activeSince) return null;
+        if (!tracks.hasFreshPublication(now)) protectionState = "DEGRADED";
+        else if (initialized && blurEnabled) protectionState = "ACTIVE";
+        return tracks.geometryAt(now, source);
     }
 
     private static boolean hasFreshResult(String source, long now) {
         if (source == null || source.isEmpty()) return false;
         Long activeSince = SOURCE_ACTIVE_SINCE.get(source);
-        FaceGeometry current = RESULTS.get(source);
-        return activeSince != null && current != null && current.captureNanos >= activeSince
-                && now - current.captureNanos <= STALE_HOLD_NS;
+        SourceTracks tracks = SOURCE_TRACKS.get(source);
+        return activeSince != null && tracks != null && tracks.lastResultNanos >= activeSince
+                && tracks.hasFreshPublication(now);
     }
 
     private static boolean isSourceActive(String source) {
@@ -577,7 +854,7 @@ public final class Main {
 
     private static void beforeEncoderDraw(Object renderer, Object snapshot) {
         EncoderState state = encoderState(renderer);
-        if (!acceptingFrames || !state.ready || snapshot == null) return;
+        if (!acceptingFrames || !blurEnabled || !state.ready || snapshot == null) return;
         try {
             int slot = field(snapshot.getClass(), "surfaceIndex").getInt(snapshot);
             int textureId = field(snapshot.getClass(), "textureId").getInt(snapshot);
@@ -596,7 +873,7 @@ public final class Main {
             if (encoderTransitionActive(renderer)) state.faceCount = -1;
             if (geometry != null) System.arraycopy(geometry.faces, 0, state.faces, 0, geometry.count * FACE_STRIDE);
             uploadGeometry(state.program, state.faceCount, state.faces, state.center, state.axisX,
-                    state.axisY, state.viewport, state.blurSampler);
+                    state.axisY, state.viewport, state.blurSampler, state.geometryScratch);
             Class<?> type = renderer.getClass();
             state.savedProgram = field(type, "drawProgram").getInt(renderer);
             state.savedPosition = field(type, "positionHandle").getInt(renderer);
@@ -636,24 +913,23 @@ public final class Main {
 
     private static void bindEncoderBlur(EncoderState state) {
         if (state.blurTexture == 0) return;
-        int[] active = new int[1], binding = new int[1];
-        GLES20.glGetIntegerv(GLES20.GL_ACTIVE_TEXTURE, active, 0);
+        GLES20.glGetIntegerv(GLES20.GL_ACTIVE_TEXTURE, state.glActive, 0);
         GLES20.glActiveTexture(GLES20.GL_TEXTURE1);
         if (!state.blurBindingActive) {
-            GLES20.glGetIntegerv(GLES20.GL_TEXTURE_BINDING_2D, binding, 0);
-            state.savedBlurBinding = binding[0];
+            GLES20.glGetIntegerv(GLES20.GL_TEXTURE_BINDING_2D, state.glBinding, 0);
+            state.savedBlurBinding = state.glBinding[0];
             state.blurBindingActive = true;
         }
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, state.blurTexture);
-        GLES20.glActiveTexture(active[0]);
+        GLES20.glActiveTexture(state.glActive[0]);
     }
 
     private static void restoreEncoderBlur(EncoderState state) {
         if (!state.blurBindingActive) return;
-        int[] active = new int[1]; GLES20.glGetIntegerv(GLES20.GL_ACTIVE_TEXTURE, active, 0);
+        GLES20.glGetIntegerv(GLES20.GL_ACTIVE_TEXTURE, state.glActive, 0);
         GLES20.glActiveTexture(GLES20.GL_TEXTURE1);
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, state.savedBlurBinding);
-        GLES20.glActiveTexture(active[0]);
+        GLES20.glActiveTexture(state.glActive[0]);
         state.blurBindingActive = false;
     }
 
@@ -684,24 +960,26 @@ public final class Main {
 
     private static void uploadGeometry(int program, int count, float[] faces,
                                         int center, int axisX, int axisY, int viewportLocation,
-                                        int blurSamplerLocation) {
+                                        int blurSamplerLocation, float[] scratch) {
         int[] prior = new int[1], viewport = new int[4];
         GLES20.glGetIntegerv(GLES20.GL_CURRENT_PROGRAM, prior, 0);
         GLES20.glGetIntegerv(GLES20.GL_VIEWPORT, viewport, 0);
         try {
             GLES20.glUseProgram(program); GLES20.glUniform1i(GLES20.glGetUniformLocation(program, "uFaceCount"), count);
             GLES20.glUniform2f(viewportLocation, viewport[2], viewport[3]);
+            GLES20.glUniform1f(GLES20.glGetUniformLocation(program, "uMaskScale"), faceMaskScale);
+            GLES20.glUniform1i(GLES20.glGetUniformLocation(program, "uMaskMode"), maskMode);
             GLES20.glUniform1i(blurSamplerLocation, 1);
             if (count > 0) {
-                float[] c = new float[count * 2], x = new float[count * 2], y = new float[count * 2];
                 for (int i = 0; i < count; i++) {
                     int src = i * FACE_STRIDE, dst = i * 2;
-                    c[dst] = faces[src]; c[dst + 1] = faces[src + 1];
-                    x[dst] = faces[src + 2]; x[dst + 1] = faces[src + 3];
-                    y[dst] = faces[src + 4]; y[dst + 1] = faces[src + 5];
+                    scratch[dst] = faces[src]; scratch[dst + 1] = faces[src + 1];
+                    scratch[8 + dst] = faces[src + 2]; scratch[9 + dst] = faces[src + 3];
+                    scratch[16 + dst] = faces[src + 4]; scratch[17 + dst] = faces[src + 5];
                 }
-                GLES20.glUniform2fv(center, count, c, 0); GLES20.glUniform2fv(axisX, count, x, 0);
-                GLES20.glUniform2fv(axisY, count, y, 0);
+                GLES20.glUniform2fv(center, count, scratch, 0);
+                GLES20.glUniform2fv(axisX, count, scratch, 8);
+                GLES20.glUniform2fv(axisY, count, scratch, 16);
             }
         } finally { GLES20.glUseProgram(prior[0]); }
     }
@@ -747,6 +1025,11 @@ public final class Main {
         emit("Camera source changed; full-frame privacy blur active until fresh detection source=" + source);
     }
 
+    private static void updateTracks(String source, FaceGeometry detections) {
+        SourceTracks tracks = SOURCE_TRACKS.computeIfAbsent(source, ignored -> new SourceTracks());
+        tracks.update(detections, System.nanoTime());
+    }
+
     private static void mapCurrentSource(Object thread, String source) {
         if (source == null || source.isEmpty()) return;
         try {
@@ -760,8 +1043,17 @@ public final class Main {
     }
 
     private static Field field(Class<?> type, String name) throws NoSuchFieldException {
+        ConcurrentHashMap<String, Field> fields = FIELD_CACHE.computeIfAbsent(
+                type, ignored -> new ConcurrentHashMap<>());
+        Field cached = fields.get(name);
+        if (cached != null) return cached;
         for (Class<?> current = type; current != null; current = current.getSuperclass()) {
-            try { Field field = current.getDeclaredField(name); field.setAccessible(true); return field; }
+            try {
+                Field field = current.getDeclaredField(name);
+                field.setAccessible(true);
+                Field raced = fields.putIfAbsent(name, field);
+                return raced == null ? field : raced;
+            }
             catch (NoSuchFieldException ignored) { }
         }
         throw new NoSuchFieldException(name);
@@ -802,45 +1094,192 @@ public final class Main {
         }
     }
 
-    public static synchronized void onUnload() {
+    public static synchronized boolean onUnload() {
+        boolean clean = true;
         acceptingFrames = false;
+        protectionState = "STOPPING";
         for (XC_MethodHook.Unhook hook : HOOKS) try { hook.unhook(); } catch (Throwable ignored) { }
         HOOKS.clear();
         CapturedFrame queued = LATEST_FRAME.getAndSet(null);
         if (queued != null) FRAME_POOL.offer(queued.rgba);
-        SubmittedFrame submitted = IN_FLIGHT.getAndSet(null);
-        if (submitted != null) { submitted.image.close(); submitted.bitmap.recycle(); }
         ExecutorService executor = frameExecutor; frameExecutor = null;
-        stopExecutor(executor, "MediaPipe input");
-        FaceLandmarker active = landmarker; landmarker = null;
-        if (active != null) try { active.close(); } catch (Throwable error) { emit("FaceLandmarker close failed", error); }
-        DRAIN_SCHEDULED.set(false); RESULTS.clear(); HELD_RESULTS.clear(); SOURCE_ACTIVE_SINCE.clear();
+        FaceLandmarker active = landmarker;
+        FaceDetector activeDetector = detector;
+        if (active != null && executor != null && !executor.isShutdown()) {
+            try { executor.submit(active::close).get(3, TimeUnit.SECONDS); }
+            catch (Throwable error) { clean = false; emit("FaceLandmarker worker close failed", error); }
+        }
+        if (activeDetector != null && executor != null && !executor.isShutdown()) {
+            try { executor.submit(activeDetector::close).get(3, TimeUnit.SECONDS); }
+            catch (Throwable error) { clean = false; emit("FaceDetector worker close failed", error); }
+        }
+        clean &= stopExecutor(executor, "MediaPipe input");
+        landmarker = null;
+        detector = null;
+        DRAIN_SCHEDULED.set(false); SOURCE_TRACKS.clear(); SOURCE_ACTIVE_SINCE.clear();
         SOURCE_BY_SLOT.clear(); SOURCE_BY_TEXTURE.clear();
         CAMERA_STATES.clear(); ENCODER_STATES.clear(); FRAME_POOL.clear(); initialized = false;
+        AndroidUtilities.runOnUIThread(() -> {
+            synchronized (BLUR_CONTROLS) {
+                for (BlurControl control : BLUR_CONTROLS.values()) control.detach();
+                BLUR_CONTROLS.clear();
+            }
+        });
+        blurEnabled = true;
+        logger = null;
+        FIELD_CACHE.clear();
+        protectionState = "DISABLED";
+        return clean;
     }
 
-    private static void stopExecutor(ExecutorService executor, String name) {
-        if (executor == null) return;
+    private static void maybeLogMetrics() {
+        long now = System.nanoTime();
+        if (now - lastMetricsLogNanos < METRICS_LOG_INTERVAL_NS) return;
+        lastMetricsLogNanos = now;
+        emit("Metrics " + getDiagnostics());
+    }
+
+    private static boolean stopExecutor(ExecutorService executor, String name) {
+        if (executor == null) return true;
         executor.shutdown();
         try {
             if (!executor.awaitTermination(3, TimeUnit.SECONDS)) {
                 executor.shutdownNow();
-                if (!executor.awaitTermination(1, TimeUnit.SECONDS)) emit(name + " executor did not stop");
+                if (!executor.awaitTermination(1, TimeUnit.SECONDS)) {
+                    emit(name + " executor did not stop");
+                    return false;
+                }
             }
-        } catch (InterruptedException error) { executor.shutdownNow(); Thread.currentThread().interrupt(); }
+        } catch (InterruptedException error) {
+            executor.shutdownNow(); Thread.currentThread().interrupt(); return false;
+        }
+        return true;
     }
 
     private static final class CameraState {
         final CleanFrameTap tap = new CleanFrameTap();
         final float[] faces = new float[MAX_FACES * FACE_STRIDE];
+        final float[] geometryScratch = new float[MAX_FACES * 2 * 3];
+        final int[] glActive = new int[1], glBinding = new int[1];
         int program, position, texture, mvp, st, center, axisX, axisY, count, viewport, blurSampler, faceCount;
         int savedProgram, savedPosition, savedTexture, savedMvp, savedSt, blurTexture, savedBlurBinding;
-        boolean swapActive, blurBindingActive, pipelineLogged; long lastCaptureNanos; ByteBuffer readPixels; String activeSource;
+        boolean swapActive, blurBindingActive, pipelineLogged; long lastCaptureNanos;
+        long captureIntervalNanos = CAPTURE_INTERVAL_NS; ByteBuffer readPixels; String activeSource;
+    }
+
+    private static final class BlurControl {
+        final FrameLayout host;
+        final View zoomSlider;
+        final FrameLayout pill;
+        final View selector;
+        final Theme.ResourcesProvider resourcesProvider;
+        final ImageView blurButton;
+        final ImageView clearButton;
+        final ViewTreeObserver.OnPreDrawListener positionListener = () -> {
+            updatePosition();
+            return true;
+        };
+
+        BlurControl(FrameLayout host, View zoomSlider, Theme.ResourcesProvider resourcesProvider) {
+            this.host = host;
+            this.zoomSlider = zoomSlider;
+            this.resourcesProvider = resourcesProvider;
+            pill = new FrameLayout(host.getContext());
+            selector = new View(host.getContext());
+            blurButton = button(R.drawable.msg_photo_blur, "Blur faces");
+            clearButton = button(R.drawable.msg_blur_off, "Do not blur faces");
+            blurButton.setOnClickListener(view -> choose(true, view));
+            clearButton.setOnClickListener(view -> choose(false, view));
+        }
+
+        private ImageView button(int icon, String description) {
+            ImageView view = new ImageView(host.getContext());
+            view.setImageResource(icon);
+            view.setScaleType(ImageView.ScaleType.CENTER);
+            view.setContentDescription(description);
+            view.setClickable(true);
+            view.setFocusable(true);
+            view.setPadding(AndroidUtilities.dp(12), AndroidUtilities.dp(12),
+                    AndroidUtilities.dp(12), AndroidUtilities.dp(12));
+            return view;
+        }
+
+        void attach() {
+            if (pill.getParent() != null) return;
+            applyTheme();
+            FrameLayout.LayoutParams selectorParams = new FrameLayout.LayoutParams(
+                    AndroidUtilities.dp(44), AndroidUtilities.dp(44), Gravity.TOP | Gravity.LEFT);
+            selectorParams.leftMargin = AndroidUtilities.dp(2);
+            selectorParams.topMargin = AndroidUtilities.dp(2);
+            pill.addView(selector, selectorParams);
+            FrameLayout.LayoutParams blurParams = new FrameLayout.LayoutParams(
+                    AndroidUtilities.dp(48), AndroidUtilities.dp(48), Gravity.LEFT | Gravity.TOP);
+            pill.addView(blurButton, blurParams);
+            FrameLayout.LayoutParams clearParams = new FrameLayout.LayoutParams(
+                    AndroidUtilities.dp(48), AndroidUtilities.dp(48), Gravity.LEFT | Gravity.TOP);
+            clearParams.leftMargin = AndroidUtilities.dp(48);
+            pill.addView(clearButton, clearParams);
+            FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(
+                    AndroidUtilities.dp(96), AndroidUtilities.dp(48), Gravity.TOP | Gravity.CENTER_HORIZONTAL);
+            host.addView(pill, params);
+            host.getViewTreeObserver().addOnPreDrawListener(positionListener);
+            pill.post(this::updatePosition);
+        }
+
+        void detach() {
+            if (host.getViewTreeObserver().isAlive()) {
+                host.getViewTreeObserver().removeOnPreDrawListener(positionListener);
+            }
+            if (pill.getParent() == host) host.removeView(pill);
+        }
+
+        void updatePosition() {
+            if (pill.getParent() != host) return;
+            // The zoom view reserves 16 dp below its visible 48 dp pill.
+            float top = zoomSlider.getY() + zoomSlider.getHeight() - AndroidUtilities.dp(8);
+            float maximum = Math.max(0, host.getHeight() - pill.getHeight() - AndroidUtilities.dp(8));
+            pill.setTranslationY(Math.min(top, maximum));
+            pill.setAlpha(zoomSlider.getAlpha());
+            pill.setVisibility(host.getVisibility() == View.VISIBLE ? View.VISIBLE : View.INVISIBLE);
+        }
+
+        void choose(boolean enabled, View source) {
+            source.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP);
+            setBlurEnabled(enabled);
+        }
+
+        void update() {
+            applyTheme();
+            float target = blurEnabled ? 0f : AndroidUtilities.dp(48);
+            selector.animate().translationX(target).setDuration(180L).start();
+            style(blurButton, blurEnabled);
+            style(clearButton, !blurEnabled);
+        }
+
+        private void applyTheme() {
+            int panel = Theme.getColor(Theme.key_chat_messagePanelBackground, resourcesProvider);
+            int selected = Theme.getColor(Theme.key_featuredStickers_addButton, resourcesProvider);
+            pill.setBackground(Theme.createRoundRectDrawable(AndroidUtilities.dp(24), panel));
+            selector.setBackground(Theme.createRoundRectDrawable(AndroidUtilities.dp(22), selected));
+        }
+
+        private void style(ImageView view, boolean selected) {
+            int selectedIcon = Theme.getColor(Theme.key_chats_actionIcon, resourcesProvider);
+            int normalIcon = Theme.getColor(Theme.key_chat_messagePanelText, resourcesProvider);
+            view.setColorFilter(selected ? selectedIcon : normalIcon, PorterDuff.Mode.SRC_IN);
+            view.setBackground(null);
+            view.setSelected(selected);
+            view.setAlpha(1.0f);
+            view.setScaleX(1.0f);
+            view.setScaleY(1.0f);
+        }
     }
 
     private static final class EncoderState {
         final CleanFrameTap tap = new CleanFrameTap();
         final float[] faces = new float[MAX_FACES * FACE_STRIDE];
+        final float[] geometryScratch = new float[MAX_FACES * 2 * 3];
+        final int[] glActive = new int[1], glBinding = new int[1];
         int width, height, program, position, texture, mvp, st, preview, resolution, alpha, texel;
         int center, axisX, axisY, count, viewport, blurSampler, faceCount, blurTexture, savedBlurBinding;
         int savedProgram, savedPosition, savedTexture, savedPreview, savedResolution, savedAlpha;
@@ -855,12 +1294,15 @@ public final class Main {
         }
     }
 
-    private static final class SubmittedFrame {
-        final long captureNanos, timestampMs; final String sourceKey; final Bitmap bitmap; final MPImage image;
-        SubmittedFrame(long captureNanos, long timestampMs, String sourceKey, Bitmap bitmap, MPImage image) {
-            this.captureNanos = captureNanos; this.timestampMs = timestampMs; this.sourceKey = sourceKey;
-            this.bitmap = bitmap; this.image = image;
+    private static final class EngineCandidate {
+        final FaceLandmarker landmarker;
+        final FaceDetector detector;
+        boolean committed;
+        EngineCandidate(FaceLandmarker landmarker, FaceDetector detector) {
+            this.landmarker = landmarker;
+            this.detector = detector;
         }
+        void close() { if (!committed) closeEngines(landmarker, detector); }
     }
 
     private static final class FaceGeometry {
@@ -868,5 +1310,128 @@ public final class Main {
         FaceGeometry(float[] faces, int count, long captureNanos, String sourceKey) {
             this.faces = faces; this.count = count; this.captureNanos = captureNanos; this.sourceKey = sourceKey;
         }
+    }
+
+    private static final class SourceTracks {
+        final FaceTrack[] tracks = new FaceTrack[MAX_FACES];
+        final boolean[] trackMatched = new boolean[MAX_FACES];
+        final boolean[] detectionMatched = new boolean[MAX_FACES];
+        long lastResultNanos, lastPublishedNanos, adaptiveHoldNanos = TRACK_HOLD_NS;
+
+        synchronized void update(FaceGeometry detections, long publishedNanos) {
+            if (lastPublishedNanos != 0L) {
+                long interval = publishedNanos - lastPublishedNanos;
+                adaptiveHoldNanos = Math.max(TRACK_HOLD_NS,
+                        Math.min(MAX_TRACK_HOLD_NS, interval * 3L + 100_000_000L));
+            }
+            lastPublishedNanos = publishedNanos;
+            lastResultNanos = detections.captureNanos;
+            java.util.Arrays.fill(trackMatched, false);
+            java.util.Arrays.fill(detectionMatched, false);
+            // Repeated global-nearest pairing is independent of detector list order
+            // and avoids identity swaps caused by matching face i to track i.
+            while (true) {
+                int bestTrack = -1, bestDetection = -1;
+                float bestDistance = Float.MAX_VALUE;
+                for (int t = 0; t < MAX_FACES; t++) {
+                    FaceTrack track = tracks[t];
+                    if (track == null || trackMatched[t]
+                            || publishedNanos - track.lastSeenPublishedNanos > adaptiveHoldNanos) continue;
+                    for (int d = 0; d < detections.count; d++) {
+                        if (detectionMatched[d]) continue;
+                        int offset = d * FACE_STRIDE;
+                        float dx = detections.faces[offset] - track.values[0];
+                        float dy = detections.faces[offset + 1] - track.values[1];
+                        float distance = dx * dx + dy * dy;
+                        float radius = Math.max(axisLength(track.values, 2), axisLength(track.values, 4));
+                        float gate = Math.max(.045f, radius * 1.6f);
+                        if (distance <= gate * gate && distance < bestDistance) {
+                            bestDistance = distance; bestTrack = t; bestDetection = d;
+                        }
+                    }
+                }
+                if (bestTrack < 0) break;
+                tracks[bestTrack].observe(detections.faces, bestDetection * FACE_STRIDE,
+                        detections.captureNanos, publishedNanos);
+                trackMatched[bestTrack] = true;
+                detectionMatched[bestDetection] = true;
+            }
+            for (int d = 0; d < detections.count; d++) if (!detectionMatched[d]) {
+                int slot = replacementSlot(publishedNanos);
+                if (slot >= 0) {
+                    tracks[slot] = new FaceTrack(detections.faces, d * FACE_STRIDE,
+                            detections.captureNanos, publishedNanos);
+                    trackMatched[slot] = true;
+                }
+            }
+            for (int t = 0; t < MAX_FACES; t++) if (tracks[t] != null
+                    && publishedNanos - tracks[t].lastSeenPublishedNanos > adaptiveHoldNanos) tracks[t] = null;
+        }
+
+        private int replacementSlot(long now) {
+            for (int i = 0; i < MAX_FACES; i++)
+                if (tracks[i] == null || now - tracks[i].lastSeenPublishedNanos > adaptiveHoldNanos) return i;
+            int oldest = -1;
+            for (int i = 0; i < MAX_FACES; i++) if (!trackMatched[i]
+                    && (oldest < 0 || tracks[i].lastSeenNanos < tracks[oldest].lastSeenNanos)) oldest = i;
+            return oldest;
+        }
+
+        synchronized FaceGeometry geometryAt(long now, String source) {
+            float[] output = new float[MAX_FACES * FACE_STRIDE];
+            int count = 0;
+            for (int i = 0; i < MAX_FACES; i++) {
+                FaceTrack track = tracks[i];
+                if (track == null || now - track.lastSeenPublishedNanos > adaptiveHoldNanos) continue;
+                track.predict(output, count * FACE_STRIDE, now);
+                count++;
+            }
+            return count == 0 ? null : new FaceGeometry(output, count, lastResultNanos, source);
+        }
+
+        synchronized boolean hasFreshPublication(long now) {
+            return lastPublishedNanos != 0L && now - lastPublishedNanos <= adaptiveHoldNanos;
+        }
+    }
+
+    private static final class FaceTrack {
+        final float[] values = new float[FACE_STRIDE];
+        final float[] velocity = new float[FACE_STRIDE];
+        long lastSeenNanos, lastSeenPublishedNanos;
+
+        FaceTrack(float[] detection, int offset, long now, long publishedNanos) {
+            System.arraycopy(detection, offset, values, 0, FACE_STRIDE);
+            lastSeenNanos = now; lastSeenPublishedNanos = publishedNanos;
+        }
+
+        void observe(float[] detection, int offset, long now, long publishedNanos) {
+            float dt = Math.max(.001f, (now - lastSeenNanos) / 1_000_000_000f);
+            float sign = detection[offset + 2] * values[2] + detection[offset + 3] * values[3] < 0f
+                    ? -1f : 1f;
+            for (int i = 0; i < FACE_STRIDE; i++) {
+                float measured = detection[offset + i] * (i >= 2 ? sign : 1f);
+                float previous = values[i];
+                float filtered = previous + TRACK_SMOOTHING * (measured - previous);
+                float measuredVelocity = (filtered - previous) / dt;
+                velocity[i] = clamp(velocity[i] * .5f + measuredVelocity * .5f, -2f, 2f);
+                values[i] = filtered;
+            }
+            lastSeenNanos = now; lastSeenPublishedNanos = publishedNanos;
+        }
+
+        void predict(float[] output, int offset, long now) {
+            float dt = Math.max(0f, Math.min(MAX_PREDICTION_NS, now - lastSeenNanos)) / 1_000_000_000f;
+            output[offset] = values[0] + velocity[0] * dt;
+            output[offset + 1] = values[1] + velocity[1] * dt;
+            System.arraycopy(values, 2, output, offset + 2, FACE_STRIDE - 2);
+        }
+    }
+
+    private static float axisLength(float[] values, int offset) {
+        return (float) Math.hypot(values[offset], values[offset + 1]);
+    }
+
+    private static float clamp(float value, float low, float high) {
+        return Math.max(low, Math.min(high, value));
     }
 }

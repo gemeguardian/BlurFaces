@@ -2,8 +2,8 @@ import pathlib
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parent
-MAIN = (ROOT / "src/main/java/com/makey/blurfaces/Main.java").read_text()
-TAP = (ROOT / "src/main/java/com/makey/blurfaces/CleanFrameTap.java").read_text()
+MAIN = (ROOT / "src/main/java/com/makey/blurfaces/g2/Main.java").read_text()
+TAP = (ROOT / "src/main/java/com/makey/blurfaces/g2/CleanFrameTap.java").read_text()
 
 
 class HookContract(unittest.TestCase):
@@ -27,10 +27,10 @@ class HookContract(unittest.TestCase):
         self.assertGreaterEqual(MAIN.count("finally { state.swapActive = false; restore"), 2)
 
     def test_late_results_are_source_bound(self):
-        self.assertIn("if (!isSourceActive(submitted.sourceKey))", MAIN)
-        self.assertIn("STALE_HOLD_NS", MAIN)
+        self.assertIn("if (isSourceActive(frame.sourceKey))", MAIN)
+        self.assertIn("TRACK_HOLD_NS", MAIN)
         self.assertIn("LATEST_FRAME.getAndSet(next)", MAIN)
-        self.assertIn("IN_FLIGHT.get() != null", MAIN)
+        self.assertIn("DRAIN_SCHEDULED.compareAndSet(false, true)", MAIN)
 
     def test_encoder_prefers_exact_texture_mapping(self):
         self.assertIn("SOURCE_BY_TEXTURE.put(textures[slot], source)", MAIN)
@@ -46,7 +46,7 @@ class HookContract(unittest.TestCase):
 
     def test_camera_flip_is_fail_closed_until_fresh_result(self):
         self.assertIn("SOURCE_ACTIVE_SINCE.put(source, now)", MAIN)
-        self.assertIn("current.captureNanos >= activeSince", MAIN)
+        self.assertIn("tracks.lastResultNanos >= activeSince", MAIN)
         self.assertIn("hasFreshResult(source, now) ? 0 : -1", MAIN)
         self.assertIn("if(uFaceCount<0){gl_FragColor=texture2D(sBlurTexture,buv());return;}", MAIN)
         self.assertIn("full-frame privacy blur active until fresh detection", MAIN)
@@ -66,8 +66,19 @@ class HookContract(unittest.TestCase):
         self.assertIn("if (encoderTransitionActive(renderer)) state.faceCount = -1", MAIN)
 
     def test_face_contour_stays_inside_blurred_core(self):
-        self.assertIn("* 0.68f, radiusV", MAIN)
-        self.assertGreaterEqual(MAIN.count("smoothstep(.82,1.0"), 2)
+        self.assertIn("* .78f + .004f", MAIN)
+        self.assertIn("rawU < .008f", MAIN)
+        self.assertIn(".022f / Math.min(radiusU, radiusV)", MAIN)
+        self.assertGreaterEqual(MAIN.count("smoothstep(.84,1.04"), 2)
+
+    def test_tracks_are_source_local_order_independent_and_bounded(self):
+        self.assertIn("Map<String, SourceTracks> SOURCE_TRACKS", MAIN)
+        self.assertIn("Repeated global-nearest pairing", MAIN)
+        self.assertIn("TRACK_SMOOTHING = 0.55f", MAIN)
+        self.assertIn("MAX_PREDICTION_NS = 120_000_000L", MAIN)
+        self.assertIn("now - track.lastSeenPublishedNanos > adaptiveHoldNanos", MAIN)
+        self.assertIn("MAX_TRACK_HOLD_NS = 1_200_000_000L", MAIN)
+        self.assertNotIn("HELD_RESULTS", MAIN)
 
 
 if __name__ == "__main__":

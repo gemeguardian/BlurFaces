@@ -1,17 +1,18 @@
 # Blur Faces Plugin Handoff
 
-Updated: 2026-08-15
+Updated: 2026-08-18
 
 ## Current Architecture
 
-Version `1.9.11` uses MediaPipe Face Landmarker `0.10.29` as its only face
+Version `1.0.0` is a source-based Elyx plugin using MediaPipe Face Landmarker `0.10.29` as its only face
 geometry source:
 
 - `Delegate.GPU`; there is no CPU fallback.
-- `RunningMode.LIVE_STREAM` with one in-flight input and one latest-frame slot.
+- Synchronous `RunningMode.VIDEO` on one GPU worker with one latest-frame slot.
 - Up to four faces, represented by PCA ellipses derived from the 36-point face oval.
-- One source-bound result map shared by preview and encoder.
-- Positive geometry is held for at most 350 ms; the plugin is not fail-closed.
+- Source-local, order-independent tracks shared by preview and encoder.
+- Each positive track is held independently for at most 350 ms and predicted for at most 120 ms.
+- Detection/presence thresholds use `0.60` to reject object pareidolia; tracking uses `0.50`.
 
 If GPU initialization fails, hooks are not retained and the host camera remains
 untouched. Do not report privacy protection in that state.
@@ -44,33 +45,52 @@ geometry drives the visible preview and encoded round video.
 
 ## Runtime Assets
 
-The installable plugin embeds only the compact core DEX. It downloads and
-SHA-verifies:
+The installable `.elyx` bundles and SHA-verifies exactly three runtime binary
+payloads, so core code, the MediaPipe Java runtime, and JNI remain available
+offline:
 
-- `face_landmarker.task`
-- `mediapipe-face-landmarker.dex`
+- generated `core.dex`
+- generated `mediapipe-runtime.dex`
 - `libmediapipe_tasks_vision_jni.so` for `arm64-v8a`
 
-Each new `DexClassLoader` receives the JNI library through a unique load
-directory while retaining the canonical library basename. This avoids native
-ownership conflicts during plugin hot reload.
+The Face Landmarker model is intentionally not bundled. On first load, the
+plugin downloads only version `float16/1` from Google's official pinned URL:
 
-Public asset URLs are under `https://makey.dev/blur-faces/`. The hashes embedded
-in the current plugin were verified against those public files on 2026-08-15.
+`https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task`
+
+Its fixed expected SHA-256 is
+`64184e229b263107bc2b804c6625db1341ff2bb731874b0bcc2fe6544e0bc9ff`.
+The download uses Java `URLConnection` for Chaquopy compatibility, explicit
+connect/read timeouts, streaming output to a temporary file, `fsync`, hash
+verification, atomic replacement, and read-only permissions. A verified model
+is reused from the stable app-private `blur_faces_models` directory without a
+network request. Missing, corrupt, or failed downloads are fail-closed: no Java
+classes are loaded and no camera hooks are installed; logs identify the failure
+and recommend checking the network and reloading the plugin.
+
+Python accesses payloads through documented `from elyx import assets`, copies
+them into one unique canonical app-private load directory, verifies fixed
+build-generated SHA-256 values after both source access and staging, and chmods
+DEX/JNI files read-only before class loading. The host runtime loader parents the
+MediaPipe runtime loader, which parents the child core loader. The Python logger
+proxy is strongly retained for the active runtime and released after Java
+`onUnload`; Java also clears its static logger reference.
 
 ## Build
 
 Run:
 
 ```bash
-./build-native.sh
+./build.sh
 ```
 
-Despite its historical name, this is now a clean Gradle/package build. It does
-not invoke the NDK or compile the legacy SCRFD sources. Output:
+This clean command generates core/runtime DEX, extracts the arm64 MediaPipe JNI,
+stages and validates the three bundled assets, updates fixed hashes, invokes
+ElyxBuilder with AST validation, and runs the Elyx archive contract. It does not
+invoke the NDK or compile the legacy SCRFD sources. Output:
 
 ```text
-build/plugin/blur-faces.plugin
+builds/blur_faces-1.0.0.elyx
 ```
 
 The legacy C++ and model files remain only as reference material and are not in
@@ -78,9 +98,12 @@ the active build or runtime.
 
 ## Device Validation
 
-Use `DEVICE_VALIDATION_1.9.11.md`. Required checks include GPU startup, front/back
+Use `DEVICE_VALIDATION_1.0.0.md` as the current device checklist. Required checks
+include first-load model download,
+cached-model airplane-mode startup, corrupt-cache fail-closed behavior, GPU startup, front/back
 camera switching, rapid yaw/roll/translation, entry/exit, disable/re-enable,
-hot reload, preview/encoder parity, and public asset hash availability.
+hot reload, preview/encoder parity, bundled asset hash verification, and a clean
+install with no prior Blur Faces cache.
 
 Do not claim TikTok-level latency or stability until those cases pass on the
 target arm64 device. The OES FBO still performs a 320x320 `glReadPixels`, so only
