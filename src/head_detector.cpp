@@ -237,46 +237,19 @@ int HeadDetector::detect(const unsigned char* rgba_pixels, int width, int height
                         float bw = xmax - xmin;
                         float bh = ymax - ymin;
 
-                        // 1. Circular Vignette / Radial Gating in Round Video:
-                        // Center of round video is (0.5, 0.5) with radius 0.50.
-                        // Objects whose center falls outside the visible circle (radius > 0.52)
-                        // are clipped away or represent peripheral corner distortion/vignette artifacts.
-                        float rad_sq = (bbox_cx - 0.5f) * (bbox_cx - 0.5f) + (bbox_cy - 0.5f) * (bbox_cy - 0.5f);
-                        if (rad_sq > 0.2704f) { // 0.52^2
-                            xptr++; yptr++; wptr++; hptr++; score_ptr++;
-                            continue;
-                        }
-
-                        // 2. Vertical position gating in round video selfies:
-                        // A human head in a round selfie circle is centered in the upper/middle region (cy <= 0.75).
-                        // Objects centered in the bottom 25% of the frame (cy > 0.75) are knees, blankets,
-                        // laps, and floor clutter when looking down, and require high confidence (prob >= 0.78).
-                        if (bbox_cy > 0.75f) {
-                            if (prob < 0.78f) {
-                                xptr++; yptr++; wptr++; hptr++; score_ptr++;
-                                continue;
-                            }
-                        }
-
                         // Physical bounding box sanity checks for human head in round video notes:
-                        // 1. Strict size bounds:
                         // - Min: 8% width, 10% height (rejects buttons, specks, tags)
-                        // - Max: 60% width, 68% height (rejects entire-room, floor, and monitor hallucinations)
-                        if (bw >= 0.08f && bh >= 0.10f && bw <= 0.60f && bh <= 0.68f) {
+                        // - Max: 85% width, 85% height (supports close-up selfies without room-filling explosions)
+                        // - Aspect ratio width/height: range [0.45, 1.60] (supports head tilts and profiles)
+                        if (bw >= 0.08f && bh >= 0.10f && bw <= 0.85f && bh <= 0.85f) {
                             if (bw < 0.11f || bh < 0.13f) {
                                 if (prob < 0.38f) {
                                     xptr++; yptr++; wptr++; hptr++; score_ptr++;
                                     continue;
                                 }
                             }
-                            // 2. Aspect ratio width/height: human head is ~0.75-0.85, range [0.60, 1.25]
-                            // Slender vertical objects like bottles, table legs (aspect < 0.55) are strictly rejected.
                             float aspect = bw / bh;
-                            if (aspect >= 0.60f && aspect <= 1.25f) {
-                                if ((aspect < 0.65f || aspect > 1.15f) && prob < 0.40f) {
-                                    xptr++; yptr++; wptr++; hptr++; score_ptr++;
-                                    continue;
-                                }
+                            if (aspect >= 0.45f && aspect <= 1.60f) {
                                 HeadBox box;
                                 box.x1 = xmin;
                                 box.y1 = ymin;
