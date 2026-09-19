@@ -11,8 +11,9 @@ ROOT = Path(__file__).resolve().parent
 ASSETS = ROOT / "BlurFaces" / "assets"
 INPUTS = {
     "dex/core.dex": ROOT / "build" / "dex" / "core.dex",
-    "dex/mediapipe-runtime.dex": ROOT / "build" / "dex" / "mesh-runtime.dex",
-    "jni/arm64-v8a/libmediapipe_tasks_vision_jni.so": ROOT / "build" / "mesh-runtime" / "libmediapipe_tasks_vision_jni.so",
+    "jni/arm64-v8a/libblur_faces.so": ROOT / "libs" / "arm64-v8a" / "libblur_faces.so",
+    "model/head_det.param": ROOT / "models" / "head_det.param",
+    "model/head_det.bin": ROOT / "models" / "head_det.bin",
 }
 
 
@@ -34,12 +35,19 @@ def validate(name, path):
         machine = struct.unpack("<H", data[18:20])[0]
         if machine != 183:
             raise ValueError(f"ELF is not AArch64: {path}")
+    if name.endswith(".param") and not data.startswith(b"7767517"):
+        raise ValueError(f"not an NCNN param file: {path}")
+    if name.endswith(".bin") and len(data) == 0:
+        raise ValueError(f"empty model bin file: {path}")
 
 
-stale_model_dir = ASSETS / "model"
-if stale_model_dir.exists():
-    shutil.rmtree(stale_model_dir)
-
+# Clean old MediaPipe assets if present
+for stale in [
+    ASSETS / "dex" / "mediapipe-runtime.dex",
+    ASSETS / "jni" / "arm64-v8a" / "libmediapipe_tasks_vision_jni.so",
+]:
+    if stale.exists():
+        stale.unlink()
 
 for name, source in INPUTS.items():
     if not source.is_file() or source.stat().st_size == 0:

@@ -1,6 +1,7 @@
 package com.makey.blurfaces.g2;
 
 import android.opengl.GLES20;
+import android.opengl.GLES30;
 
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -8,10 +9,11 @@ import java.nio.FloatBuffer;
 
 /** Context-local OES downsample and ping-pong Gaussian blur pipeline. */
 final class CleanFrameTap {
-    static final int SIZE = 320;
+    static final int SIZE = 192;
     private static final int GL_TEXTURE_EXTERNAL_OES = 0x8D65;
     private static final int GL_TEXTURE_BINDING_EXTERNAL_OES = 0x8D67;
     private static final int GL_VERTEX_ATTRIB_ARRAY_ENABLED = 0x8622;
+    private static final int PBO_COUNT = 2;
 
     private static final String OES_VS =
             "attribute vec2 aPos;attribute vec2 aTex;uniform mat4 uMVPMatrix;uniform mat4 uSTMatrix;" +
@@ -35,6 +37,11 @@ final class CleanFrameTap {
     private int oesProgram, blurProgram, vbo;
     private final int[] textures = new int[2];
     private final int[] fbos = new int[2];
+    private final int[] pbos = new int[PBO_COUNT];
+    private int pboIndex = 0;
+    private boolean pboInitialized = false;
+    private boolean pboPrimed = false;
+    private boolean pboSupported = true;
     private int oesPos, oesTex, oesMvp, oesSt, oesSampler;
     private int blurPos, blurTex, blurSampler, blurStep;
     private boolean ready, failed;
@@ -46,15 +53,33 @@ final class CleanFrameTap {
 
     String lastError() { return lastError; }
 
+    static float clampBlurRadiusScale(float blurRadiusScale) {
+        if (!Float.isFinite(blurRadiusScale) || blurRadiusScale < 1.0f) {
+            return 1.0f;
+        } else if (blurRadiusScale > 2.5f) {
+            return 2.5f;
+        }
+        return blurRadiusScale;
+    }
+
     /** Returns the final RGBA blur texture, or zero if this frame could not be rendered. */
     int renderBlur(int oesTexture, float[] mvpMatrix, float[] stMatrix,
                    float[] hostTexCoords, ByteBuffer cleanReadback) {
-        if (failed || oesTexture <= 0 || stMatrix == null || stMatrix.length != 16
+        return renderBlur(oesTexture, mvpMatrix, stMatrix, hostTexCoords, cleanReadback, 1.0f);
+    }
+
+    int renderBlur(int oesTexture, float[] mvpMatrix, float[] stMatrix,
+                   float[] hostTexCoords, ByteBuffer cleanReadback, float blurRadiusScale) {
+        if (oesTexture <= 0 || stMatrix == null || stMatrix.length != 16
                 || mvpMatrix == null || mvpMatrix.length != 16
                 || hostTexCoords == null || hostTexCoords.length != 8
                 || (cleanReadback != null && cleanReadback.capacity() < SIZE * SIZE * 4)) {
-            lastError = failed ? "pipeline initialization previously failed" : "invalid frame input";
+            lastError = "invalid frame input";
             return 0;
+        }
+        blurRadiusScale = clampBlurRadiusScale(blurRadiusScale);
+        if (failed) {
+            release();
         }
         GLState saved = new GLState();
         try {
@@ -86,13 +111,17 @@ final class CleanFrameTap {
             GLES20.glUniform1i(oesSampler, 0);
             GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4);
             if (cleanReadback != null) {
-                cleanReadback.position(0);
-                GLES20.glReadPixels(0, 0, SIZE, SIZE, GLES20.GL_RGBA,
-                        GLES20.GL_UNSIGNED_BYTE, cleanReadback);
+                try {
+                    readPixelsAsync(cleanReadback);
+                } catch (Throwable readError) {
+                    lastError = "readPixels error=" + readError;
+                } finally {
+                    drainErrors();
+                }
             }
 
             uploadQuad(FULL_QUAD_TEX);
-            float step = 4.5f / SIZE;
+            float step = (4.5f * blurRadiusScale) / SIZE;
             drawBlur(textures[0], fbos[1], step, 0f);
             drawBlur(textures[1], fbos[0], 0f, step);
             drawBlur(textures[0], fbos[1], step, 0f);
@@ -112,6 +141,70 @@ final class CleanFrameTap {
             return 0;
         } finally {
             saved.restore();
+        }
+    }
+
+    private void readPixelsAsync(ByteBuffer cleanReadback) {
+        cleanReadback.position(0);
+        final int bytes = SIZE * SIZE * 4;
+        if (pboSupported) {
+            try {
+                if (!pboInitialized) {
+                    GLES30.glGenBuffers(PBO_COUNT, pbos, 0);
+                    for (int i = 0; i < PBO_COUNT; i++) {
+                        GLES30.glBindBuffer(GLES30.GL_PIXEL_PACK_BUFFER, pbos[i]);
+                        GLES30.glBufferData(GLES30.GL_PIXEL_PACK_BUFFER, bytes, null, GLES30.GL_STREAM_READ);
+                    }
+                    GLES30.glBindBuffer(GLES30.GL_PIXEL_PACK_BUFFER, 0);
+                    pboInitialized = (pbos[0] != 0 && pbos[1] != 0);
+                    pboIndex = 0;
+                    pboPrimed = false;
+                }
+                if (pboInitialized) {
+                    int nextIndex = (pboIndex + 1) % PBO_COUNT;
+                    // Trigger asynchronous readback into currently bound PBO
+                    GLES30.glBindBuffer(GLES30.GL_PIXEL_PACK_BUFFER, pbos[pboIndex]);
+                    GLES30.glReadPixels(0, 0, SIZE, SIZE, GLES30.GL_RGBA, GLES30.GL_UNSIGNED_BYTE, 0);
+
+                    if (pboPrimed) {
+                        // Read from the other PBO (which finished transfer from previous frame)
+                        GLES30.glBindBuffer(GLES30.GL_PIXEL_PACK_BUFFER, pbos[nextIndex]);
+                        ByteBuffer mapped = (ByteBuffer) GLES30.glMapBufferRange(
+                                GLES30.GL_PIXEL_PACK_BUFFER, 0, bytes, GLES30.GL_MAP_READ_BIT);
+                        if (mapped != null) {
+                            try {
+                                cleanReadback.put(mapped);
+                                cleanReadback.position(0);
+                            } finally {
+                                GLES30.glUnmapBuffer(GLES30.GL_PIXEL_PACK_BUFFER);
+                            }
+                        } else {
+                            // If mapping wasn't ready yet or failed, direct fallback
+                            GLES30.glBindBuffer(GLES30.GL_PIXEL_PACK_BUFFER, 0);
+                            GLES20.glReadPixels(0, 0, SIZE, SIZE, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, cleanReadback);
+                        }
+                    } else {
+                        // On first frame, read directly while the PBO pipeline warms up
+                        GLES30.glBindBuffer(GLES30.GL_PIXEL_PACK_BUFFER, 0);
+                        GLES20.glReadPixels(0, 0, SIZE, SIZE, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, cleanReadback);
+                        pboPrimed = true;
+                    }
+                    GLES30.glBindBuffer(GLES30.GL_PIXEL_PACK_BUFFER, 0);
+                    pboIndex = nextIndex;
+                    return;
+                }
+            } catch (Throwable t) {
+                pboSupported = false;
+                try {
+                    GLES30.glBindBuffer(GLES30.GL_PIXEL_PACK_BUFFER, 0);
+                } catch (Throwable ignored) {}
+            }
+        }
+        // Direct fallback if GLES30 / PBO is not supported
+        try {
+            GLES20.glReadPixels(0, 0, SIZE, SIZE, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, cleanReadback);
+        } catch (Throwable error) {
+            lastError = "direct readPixels error=" + error;
         }
     }
 
@@ -176,7 +269,11 @@ final class CleanFrameTap {
     private int createProgram(String vertexSource, String fragmentSource) {
         int vs = compile(GLES20.GL_VERTEX_SHADER, vertexSource);
         int fs = compile(GLES20.GL_FRAGMENT_SHADER, fragmentSource);
-        if (vs == 0 || fs == 0) return 0;
+        if (vs == 0 || fs == 0) {
+            if (vs != 0) GLES20.glDeleteShader(vs);
+            if (fs != 0) GLES20.glDeleteShader(fs);
+            return 0;
+        }
         int value = GLES20.glCreateProgram();
         GLES20.glAttachShader(value, vs); GLES20.glAttachShader(value, fs);
         GLES20.glLinkProgram(value); GLES20.glDeleteShader(vs); GLES20.glDeleteShader(fs);
@@ -221,6 +318,15 @@ final class CleanFrameTap {
 
     void release() {
         try { if (vbo != 0) GLES20.glDeleteBuffers(1, new int[]{vbo}, 0); } catch (Throwable ignored) { }
+        try {
+            if (pbos[0] != 0 || pbos[1] != 0) {
+                GLES20.glDeleteBuffers(PBO_COUNT, pbos, 0);
+            }
+        } catch (Throwable ignored) { }
+        pboInitialized = false;
+        pboPrimed = false;
+        pboIndex = 0;
+        pbos[0] = pbos[1] = 0;
         try { GLES20.glDeleteFramebuffers(2, fbos, 0); } catch (Throwable ignored) { }
         try { GLES20.glDeleteTextures(2, textures, 0); } catch (Throwable ignored) { }
         try { if (oesProgram != 0) GLES20.glDeleteProgram(oesProgram); } catch (Throwable ignored) { }
@@ -228,6 +334,7 @@ final class CleanFrameTap {
         vbo = oesProgram = blurProgram = 0;
         textures[0] = textures[1] = fbos[0] = fbos[1] = 0;
         ready = false;
+        failed = false;
     }
 
     private static final class GLState {
@@ -282,6 +389,9 @@ final class CleanFrameTap {
                 if (scissor) GLES20.glEnable(GLES20.GL_SCISSOR_TEST); else GLES20.glDisable(GLES20.GL_SCISSOR_TEST);
                 if (cull) GLES20.glEnable(GLES20.GL_CULL_FACE); else GLES20.glDisable(GLES20.GL_CULL_FACE);
             } catch (Throwable ignored) { }
+            finally {
+                try { GLES30.glBindBuffer(GLES30.GL_PIXEL_PACK_BUFFER, 0); } catch (Throwable ignored) { }
+            }
         }
     }
 }

@@ -26,7 +26,7 @@ active `InstantCameraView.surfaceIndex`.
 
 At this boundary the camera EGL context is current and the host has not yet
 created its encoder snapshot or rendered preview. `CleanFrameTap` renders the
-active OES texture into a 320x320 FBO using the host MVP, SurfaceTexture matrix,
+active OES texture into a 192x192 FBO using the host MVP, SurfaceTexture matrix,
 and texture coordinates. The `glReadPixels` rows are reversed before creating
 the MediaPipe `MPImage`.
 
@@ -106,5 +106,5 @@ hot reload, preview/encoder parity, bundled asset hash verification, and a clean
 install with no prior Blur Faces cache.
 
 Do not claim TikTok-level latency or stability until those cases pass on the
-target arm64 device. The OES FBO still performs a 320x320 `glReadPixels`, so only
+target arm64 device. The OES FBO still performs a 192x192 `glReadPixels`, so only
 device measurements can establish actual end-to-end latency.

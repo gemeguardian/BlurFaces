@@ -13,31 +13,12 @@ android {
         sourceCompatibility JavaVersion.VERSION_11
         targetCompatibility JavaVersion.VERSION_11
     }
+    testOptions {
+        unitTests.returnDefaultValues = true
+    }
 }
 
 repositories { google(); mavenCentral(); maven { url 'https://maven.aliucord.com/snapshots' } }
-
-// MediaPipe remains a separate offline runtime DEX asset and loads the compact
-// core as its child. Only the Face Landmarker model is downloaded at runtime.
-configurations { mediaPipeRuntime }
-
-dependencies { mediaPipeRuntime 'com.google.mediapipe:tasks-vision:0.10.29' }
-
-tasks.register("extractMediaPipeRuntime") {
-    outputs.dir "$buildDir/mediapipe-jars"
-    doLast {
-        def destination = file("$buildDir/mediapipe-jars")
-        delete destination; mkdir destination
-        configurations.mediaPipeRuntime.files.each { artifact ->
-            def key = artifact.name.replaceAll('[^A-Za-z0-9._-]', '_')
-            if (artifact.name.endsWith('.aar')) {
-                copy { from zipTree(artifact); include 'classes.jar'; into "$destination/$key" }
-            } else if (artifact.name.endsWith('.jar')) {
-                copy { from artifact; into "$destination/$key" }
-            }
-        }
-    }
-}
 
 tasks.register("aarToCoreDex") {
     dependsOn "assembleRelease"
@@ -52,45 +33,20 @@ tasks.register("aarToCoreDex") {
     }
 }
 
-tasks.register("mediaPipeToDex") {
-    dependsOn "extractMediaPipeRuntime"
-    doLast {
-        def output = file("$buildDir/dex/mesh")
-        delete output; mkdir output
-        def inputs = fileTree("$buildDir/mediapipe-jars") { include '**/*.jar' }.files
-        exec { commandLine(["${android.sdkDirectory}/build-tools/36.0.0/d8"] + inputs.toList() + ["--output", output.absolutePath]) }
-    }
-}
-
 tasks.register("stageDex") {
-    dependsOn "aarToCoreDex", "mediaPipeToDex"
+    dependsOn "aarToCoreDex"
     doLast {
         def output = file("$buildDir/dex")
         copy { from "$output/core/classes.dex"; into output; rename { 'core.dex' } }
-        copy { from "$output/mesh/classes.dex"; into output; rename { 'mesh-runtime.dex' } }
     }
 }
 
 tasks.register("buildDex") { dependsOn "stageDex" }
 
-// Extract the MediaPipe arm64 JNI payload for the bundled Elyx asset set.
-tasks.register("extractMeshNative") {
-    dependsOn "extractMediaPipeRuntime"
-    outputs.file "$buildDir/mesh-runtime/libmediapipe_tasks_vision_jni.so"
-    doLast {
-        def output = file("$buildDir/mesh-runtime/libmediapipe_tasks_vision_jni.so")
-        output.parentFile.mkdirs()
-        def vision = configurations.mediaPipeRuntime.files.find { it.name.startsWith('tasks-vision-') }
-        copy { from zipTree(vision); include 'jni/arm64-v8a/libmediapipe_tasks_vision_jni.so'; into output.parentFile }
-        def nested = file("$buildDir/mesh-runtime/jni/arm64-v8a/libmediapipe_tasks_vision_jni.so")
-        if (nested.exists()) { output.delete(); nested.renameTo(output); file("$buildDir/mesh-runtime/jni").deleteDir() }
-    }
-}
-
 dependencies {
     compileOnly files('libs/exteragram.jar')
     compileOnly 'com.aliucord:Aliuhook:1.1.3'
-    // Runtime DEX/JNI are bundled and SHA-verified. There is no CPU delegate or
-    // native detector fallback.
-    compileOnly 'com.google.mediapipe:tasks-vision:0.10.29'
+    testImplementation 'junit:junit:4.13.2'
+    testImplementation 'com.aliucord:Aliuhook:1.1.3'
+    testImplementation files('libs/exteragram.jar')
 }

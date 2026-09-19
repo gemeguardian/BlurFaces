@@ -64,6 +64,16 @@ class CameraBlurControlContract(unittest.TestCase):
         self.assertIn("BLUR_CONTROLS.get(cameraView)", install)
         self.assertIn("existing.attach()", install)
 
+    def test_degraded_and_failed_protection_state_indication(self):
+        self.assertIn("private static void setProtectionState(String newState)", MAIN)
+        control = MAIN[MAIN.index("private static final class BlurControl") :]
+        self.assertIn('"DEGRADED".equals(protectionState)', control)
+        self.assertIn('"FAILED".equals(protectionState)', control)
+        self.assertIn("0xFFFFA000", control)
+        self.assertIn("0xFFE53935", control)
+        self.assertIn('"Face blur active (degraded)"', control)
+        self.assertIn('"Blur faces"', control)
+
 
 if __name__ == "__main__":
     unittest.main()

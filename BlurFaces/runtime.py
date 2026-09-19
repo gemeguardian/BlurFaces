@@ -9,9 +9,8 @@ import time
 from android.view import View
 from dalvik.system import DexClassLoader
 from elyx import assets
-from java import dynamic_proxy, jarray, jbyte, jint
-from java.lang import Integer, String
-from java.net import URL
+from java import dynamic_proxy, jarray, jbyte, jfloat, jint
+from java.lang import Float, Integer, String
 from java.util.function import Consumer, IntConsumer
 from org.telegram.messenger import ApplicationLoader
 
@@ -20,35 +19,30 @@ from .asset_hashes import ASSET_HASHES
 
 CLASS_NAME = "com.makey.blurfaces.g2.Main"
 SETTINGS_BRIDGE_CLASS_NAME = "com.makey.blurfaces.g2.ModelSettingsBridge"
-MODEL_URL = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task"
-MODEL_SHA256 = "64184e229b263107bc2b804c6625db1341ff2bb731874b0bcc2fe6544e0bc9ff"
-MODEL_FILENAME = "face_landmarker-float16-v1.task"
-LITE_MODEL_URL = "https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite"
-LITE_MODEL_SHA256 = "b4578f35940bf5a1a655214a1cce5cab13eba73c1297cd78e1a04c2380b0152f"
-LITE_MODEL_FILENAME = "blaze_face_short_range-float16-v1.tflite"
-FAR_MODEL_URL = "https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_full_range/float16/1/blaze_face_full_range.tflite"
-FAR_MODEL_SHA256 = "3698b18f063835bc609069ef052228fbe86d9c9a6dc8dcb7c7c2d69aed2b181b"
-FAR_MODEL_FILENAME = "blaze_face_full_range-float16-v1.tflite"
-CONNECT_TIMEOUT_MS = 15_000
-READ_TIMEOUT_MS = 60_000
+
+MODEL_FILENAME = "head_det.param"
+BIN_FILENAME = "head_det.bin"
 
 MODEL_SPECS = {
-    "precise": (MODEL_URL, MODEL_SHA256, MODEL_FILENAME, "Face Landmarker"),
-    "near": (LITE_MODEL_URL, LITE_MODEL_SHA256, LITE_MODEL_FILENAME, "short-range Face Detector"),
-    "far": (FAR_MODEL_URL, FAR_MODEL_SHA256, FAR_MODEL_FILENAME, "full-range Face Detector"),
+    "precise": ("offline://ncnn/head_det.param", ASSET_HASHES["model/head_det.param"], MODEL_FILENAME, "NCNN Head Detector"),
+    "near": ("offline://ncnn/head_det.param", ASSET_HASHES["model/head_det.param"], MODEL_FILENAME, "NCNN Head Detector (Near)"),
+    "far": ("offline://ncnn/head_det.param", ASSET_HASHES["model/head_det.param"], MODEL_FILENAME, "NCNN Head Detector (Far)"),
 }
 
-LOADER_ABI_SALT = "hot-swap-core-v3"
+LOADER_ABI_SALT = "ncnn-native-v3"
 CORE_BUNDLE_ID = hashlib.sha256((LOADER_ABI_SALT + "\0" +
     ASSET_HASHES["dex/core.dex"]).encode("ascii")).hexdigest()
 RUNTIME_BUNDLE_ID = hashlib.sha256((LOADER_ABI_SALT + "\0" + "".join(
     ASSET_HASHES[name] for name in (
-        "dex/mediapipe-runtime.dex",
-        "jni/arm64-v8a/libmediapipe_tasks_vision_jni.so",
+        "dex/core.dex",
+        "jni/arm64-v8a/libblur_faces.so",
+        "model/head_det.param",
+        "model/head_det.bin",
     )
 )).encode("ascii")).hexdigest()
-_REGISTRY_KEY = "_blur_faces_mediapipe_runtime_v3"
+_REGISTRY_KEY = "_blur_faces_ncnn_runtime_v3"
 _LEGACY_REGISTRY_KEYS = (
+    "_blur_faces_mediapipe_runtime_v3",
     "_blur_faces_mediapipe_runtime_v2",
     "_blur_faces_mediapipe_runtime",
 )
@@ -82,23 +76,9 @@ def _runtime_registry():
             "methods": {},
             "reconfigure_sequence": 0,
         }
-        if isinstance(legacy, dict):
-            legacy_lock = legacy.get("lock")
-            if legacy_lock is not None:
-                with legacy_lock:
-                    if legacy.get("runtime_bundle_id") in (None, RUNTIME_BUNDLE_ID):
-                        registry["runtime_bundle_id"] = legacy.get("runtime_bundle_id")
-                        registry["runtime_dir"] = legacy.get("runtime_dir")
-                        registry["runtime_loader"] = legacy.get("runtime_loader")
-                        registry["core_bundle_id"] = legacy.get("core_bundle_id")
-                        registry["core_loader"] = legacy.get("core_loader")
-                        registry["main_class"] = legacy.get("main_class")
-                        registry["settings_bridge_class"] = legacy.get("settings_bridge_class")
-                        registry["owner"] = legacy.get("owner")
-                        registry["broken"] = bool(legacy.get("broken", False))
-            for key in _LEGACY_REGISTRY_KEYS:
-                if hasattr(sys, key):
-                    delattr(sys, key)
+        for key in _LEGACY_REGISTRY_KEYS:
+            if hasattr(sys, key):
+                delattr(sys, key)
         setattr(sys, _REGISTRY_KEY, registry)
     else:
         registry.setdefault("module_epoch", 0)
@@ -187,10 +167,8 @@ def _loaded_runtime_matches(registry):
     if not runtime_dir:
         return False
     expected = {
-        os.path.join(runtime_dir, "mediapipe-runtime.dex"):
-            ASSET_HASHES["dex/mediapipe-runtime.dex"],
-        os.path.join(runtime_dir, "jni", "arm64-v8a", "libmediapipe_tasks_vision_jni.so"):
-            ASSET_HASHES["jni/arm64-v8a/libmediapipe_tasks_vision_jni.so"],
+        os.path.join(runtime_dir, "jni", "arm64-v8a", "libblur_faces.so"):
+            ASSET_HASHES["jni/arm64-v8a/libblur_faces.so"],
     }
     return all(os.path.isfile(path) and _sha256(path) == digest
                for path, digest in expected.items())
@@ -202,7 +180,7 @@ def _release_loaded_core(registry):
         clean = dex_class.getMethod("onUnload").invoke(None)
         if clean is False:
             registry["broken"] = True
-            raise RuntimeError("MediaPipe worker did not stop; restart the application")
+            raise RuntimeError("Native worker did not stop; restart the application")
         registry["owner"] = None
         try:
             dex_class.getMethod("clearLogger").invoke(None)
@@ -221,177 +199,88 @@ def _ensure_runtime_loaders(context, registry):
         raise RuntimeError("Stale Blur Faces plugin instance")
     if loaded_epoch < _MODULE_EPOCH:
         registry["module_epoch"] = _MODULE_EPOCH
-    root = context.getDir("blur_faces_runtime_v2", 0).getCanonicalPath()
+    root = context.getDir("blur_faces_runtime_v3", 0).getCanonicalPath()
     runtime_dir = os.path.join(root, "runtime_" + RUNTIME_BUNDLE_ID)
     core_dir = os.path.join(root, "core_" + CORE_BUNDLE_ID)
     native_dir = os.path.join(runtime_dir, "jni", "arm64-v8a")
+    model_dir = os.path.join(root, "models")
     os.makedirs(native_dir, exist_ok=True)
+    os.makedirs(model_dir, exist_ok=True)
     core_path = _stage_asset("dex/core.dex", os.path.join(core_dir, "core.dex"), True)
-    runtime_path = _stage_asset(
-        "dex/mediapipe-runtime.dex",
-        os.path.join(runtime_dir, "mediapipe-runtime.dex"), True,
+    so_path = _stage_asset(
+        "jni/arm64-v8a/libblur_faces.so",
+        os.path.join(native_dir, "libblur_faces.so"), True,
     )
     _stage_asset(
-        "jni/arm64-v8a/libmediapipe_tasks_vision_jni.so",
-        os.path.join(native_dir, "libmediapipe_tasks_vision_jni.so"), True,
+        "model/head_det.param",
+        os.path.join(model_dir, "head_det.param"), True,
+    )
+    _stage_asset(
+        "model/head_det.bin",
+        os.path.join(model_dir, "head_det.bin"), True,
     )
 
-    opt = context.getDir("blur_faces_dex_opt_v2", 0).getCanonicalPath()
+    opt = context.getDir("blur_faces_dex_opt_v3", 0).getCanonicalPath()
     parent = context.getClassLoader()
-    if registry["runtime_loader"] is not None:
-        if registry["runtime_bundle_id"] not in (None, RUNTIME_BUNDLE_ID):
-            registry["restart_reason"] = "MediaPipe DEX/JNI bundle changed while loaded"
-            raise RuntimeError(registry["restart_reason"] + "; restart the application")
-        if registry["runtime_bundle_id"] is None and not _loaded_runtime_matches(registry):
-            registry["restart_reason"] = "Loaded MediaPipe DEX/JNI bundle cannot be verified"
-            raise RuntimeError(registry["restart_reason"] + "; restart the application")
-        registry["runtime_bundle_id"] = RUNTIME_BUNDLE_ID
-    else:
-        registry["runtime_loader"] = DexClassLoader(runtime_path, opt, native_dir, parent)
-        registry["runtime_bundle_id"] = RUNTIME_BUNDLE_ID
 
-    if (registry["core_loader"] is not None
+    if (registry.get("core_loader") is not None
             and registry.get("core_bundle_id") == CORE_BUNDLE_ID):
         registry["core_load_token"] = _CORE_LOAD_TOKEN
         registry["runtime_dir"] = runtime_dir
         return
-    if registry["core_loader"] is not None:
-        # A compatible MediaPipe parent can stay loaded, but changed plugin Java
-        # code must be adopted now. Otherwise an update keeps executing stale model
-        # rows until the whole client restarts. Host UItem may retain old factory
-        # classes, but new settings definitions use factories from this loader.
-        _release_loaded_core(registry)
-    registry["core_loader"] = DexClassLoader(
-        core_path, opt, native_dir, registry["runtime_loader"]
-    )
+
+    if registry.get("core_loader") is not None:
+        registry["restart_reason"] = "Blur Faces core DEX changed while loaded"
+        raise RuntimeError(registry["restart_reason"] + "; restart the application")
+
+    loader = DexClassLoader(core_path, opt, native_dir, parent)
+    registry["core_loader"] = loader
+    registry["runtime_loader"] = loader
     registry["core_bundle_id"] = CORE_BUNDLE_ID
+    registry["runtime_bundle_id"] = RUNTIME_BUNDLE_ID
     registry["core_load_token"] = _CORE_LOAD_TOKEN
     registry["runtime_dir"] = runtime_dir
 
-
-def _model_location(context, model_kind):
-    model_filename = MODEL_SPECS[model_kind][2]
-    model_dir = context.getDir("blur_faces_models", 0).getCanonicalPath()
-    return model_dir, os.path.join(model_dir, model_filename)
+    bridge_class = loader.loadClass("com.makey.blurfaces.g2.NativeBridge")
+    bridge_class.getMethod("ensureLoaded", String).invoke(None, so_path)
 
 
 def cached_model_path(context, model_kind="precise"):
-    _, model_sha256, _, _ = MODEL_SPECS[model_kind]
-    _, model_path = _model_location(context, model_kind)
-    if os.path.isfile(model_path):
-        actual = _sha256(model_path)
-        if actual == model_sha256:
-            os.chmod(model_path, 0o444)
-            return model_path
-        os.chmod(model_path, 0o600)
-        os.unlink(model_path)
-    return None
+    root = context.getDir("blur_faces_runtime_v3", 0).getCanonicalPath()
+    param_path = os.path.join(root, "models", "head_det.param")
+    if os.path.isfile(param_path) and _sha256(param_path) == ASSET_HASHES["model/head_det.param"]:
+        return param_path
+    registry = _runtime_registry()
+    with registry["lock"]:
+        _ensure_runtime_loaders(context, registry)
+    return param_path if os.path.isfile(param_path) else None
 
 
 def is_model_downloaded(model_index):
-    context = ApplicationLoader.applicationContext
-    model_kind = ("precise", "near", "far")[model_index]
-    return cached_model_path(context, model_kind) is not None
+    return True
 
 
 def download_model(plugin, model_index, progress_callback=None, is_current=None):
+    if is_current is not None and not is_current():
+        raise InterruptedError("model download cancelled")
     context = ApplicationLoader.applicationContext
-    model_kind = ("precise", "near", "far")[model_index]
-    model_url, model_sha256, model_filename, model_label = MODEL_SPECS[model_kind]
-    cached = cached_model_path(context, model_kind)
-    if cached is not None:
-        return cached
-    model_dir, model_path = _model_location(context, model_kind)
-
-    os.makedirs(model_dir, exist_ok=True)
-    fd, temporary = tempfile.mkstemp(prefix=model_filename + ".", suffix=".download", dir=model_dir)
-    os.close(fd)
-    connection = None
-    input_stream = None
-    try:
-        plugin.log(f"[BlurFaces] Downloading {model_label} model from official Google URL: {model_url}")
-        connection = URL(model_url).openConnection()
-        connection.setConnectTimeout(CONNECT_TIMEOUT_MS)
-        connection.setReadTimeout(READ_TIMEOUT_MS)
-        connection.setUseCaches(False)
-        connection.setRequestProperty("Accept-Encoding", "identity")
-        connection.connect()
-        total_bytes = int(connection.getContentLengthLong())
-        if total_bytes <= 0:
-            total_bytes = -1
-        if progress_callback is not None:
-            progress_callback(2, 0, total_bytes)
-        input_stream = connection.getInputStream()
-        buffer = jarray(jbyte)(64 * 1024)
-        downloaded_bytes = 0
-        last_update = 0.0
-        with open(temporary, "wb") as output:
-            while True:
-                if is_current is not None and not is_current():
-                    raise InterruptedError("model download cancelled")
-                count = input_stream.read(buffer)
-                if count == -1:
-                    break
-                if count:
-                    output.write(bytearray(value & 0xFF for value in buffer[:count]))
-                    downloaded_bytes += count
-                    now = time.monotonic()
-                    if progress_callback is not None and now - last_update >= 0.075:
-                        progress_callback(2, downloaded_bytes, total_bytes)
-                        last_update = now
-            output.flush()
-            os.fsync(output.fileno())
-
-        if progress_callback is not None:
-            progress_callback(2, downloaded_bytes, total_bytes)
-            progress_callback(3, downloaded_bytes, total_bytes)
-        actual = _sha256(temporary)
-        if actual != model_sha256:
-            raise ValueError(
-                f"downloaded model SHA-256 mismatch: expected {model_sha256}, got {actual}"
-            )
-        os.replace(temporary, model_path)
-        os.chmod(model_path, 0o444)
-        if progress_callback is not None:
-            progress_callback(4, downloaded_bytes, total_bytes)
-        plugin.log(f"[BlurFaces] {model_label} model downloaded and verified: {model_path}")
-        return model_path
-    except Exception as error:
-        cancelled = isinstance(error, InterruptedError)
-        if progress_callback is not None and not cancelled:
-            progress_callback(5, locals().get("downloaded_bytes", 0),
-                              locals().get("total_bytes", -1))
-        if not cancelled:
-            plugin.log(
-                f"[BlurFaces] {model_label} model unavailable; camera hooks will not be installed. "
-                f"Check the network and reload the plugin ({type(error).__name__}: {error})"
-            )
-        return None
-    finally:
-        if input_stream is not None:
-            try:
-                input_stream.close()
-            except Exception:
-                pass
-        if connection is not None:
-            try:
-                connection.disconnect()
-            except Exception:
-                pass
-        if os.path.exists(temporary):
-            os.unlink(temporary)
+    registry = _runtime_registry()
+    with registry["lock"]:
+        _ensure_runtime_loaders(context, registry)
+    path = cached_model_path(context)
+    if progress_callback is not None:
+        progress_callback(2, 1, 1)
+        progress_callback(3, 1, 1)
+        progress_callback(4, 1, 1)
+    if plugin is not None:
+        plugin.log(f"[BlurFaces] Embedded NCNN model ready: {path}")
+    return path
 
 
 def delete_model(plugin, model_index):
-    context = ApplicationLoader.applicationContext
-    model_kind = ("precise", "near", "far")[model_index]
-    _, model_path = _model_location(context, model_kind)
-    if not os.path.isfile(model_path):
-        return False
-    os.chmod(model_path, 0o600)
-    os.unlink(model_path)
-    plugin.log(f"[BlurFaces] Deleted cached {MODEL_SPECS[model_kind][3]} model")
-    return True
+    if plugin is not None:
+        plugin.log("[BlurFaces] Embedded NCNN model is built-in and cannot be deleted")
+    return False
 
 
 def get_model_settings_bridge():
@@ -404,6 +293,10 @@ def get_model_settings_bridge():
                 SETTINGS_BRIDGE_CLASS_NAME
             )
         return registry["settings_bridge_class"]
+
+
+def runtime_restart_reason():
+    return _runtime_registry().get("restart_reason")
 
 
 def model_settings_item(bridge_class, index):
@@ -486,12 +379,12 @@ class PresetClickCallback(dynamic_proxy(IntConsumer)):
 
 class DexRuntime:
     def __init__(self, plugin, round_video_width=0, face_mask_scale=100,
-                 detection_confidence=60, use_gpu=True, model_index=0):
+                 detection_confidence=38, use_gpu=True, model_index=0):
         self.plugin = plugin
         self.round_video_width = round_video_width
         self.face_mask_scale = face_mask_scale
         self.detection_confidence = detection_confidence
-        self.use_gpu = use_gpu
+        self.use_gpu = False
         self.model_kind = ("precise", "near", "far")[model_index]
         self.mask_mode = 0
         self.dex_main_class = None
@@ -507,19 +400,21 @@ class DexRuntime:
             get_model_settings_bridge()
             model_path = cached_model_path(context, self.model_kind)
             if model_path is None:
-                self.plugin.log(
-                    f"[BlurFaces] {MODEL_SPECS[self.model_kind][3]} model is not downloaded; "
-                    "open plugin settings to download it"
-                )
+                registry = _runtime_registry()
+                with registry["lock"]:
+                    _ensure_runtime_loaders(context, registry)
+                model_path = cached_model_path(context, self.model_kind)
+            if model_path is None:
+                self.plugin.log("[BlurFaces] Offline model staging failed")
                 return False
             self.plugin.log(
-                f"[BlurFaces] Reusing verified cached {MODEL_SPECS[self.model_kind][3]} model: {model_path}"
+                f"[BlurFaces] Active offline NCNN Head Detector model: {model_path}"
             )
             registry = _runtime_registry()
             with registry["lock"]:
                 _cancel_deferred_shutdown(registry)
                 if registry["broken"]:
-                    self.plugin.log("[BlurFaces] MediaPipe runtime requires an application restart")
+                    self.plugin.log("[BlurFaces] Native runtime requires an application restart")
                     return False
                 self.runtime_dir = registry["runtime_dir"]
                 if registry["main_class"] is None:
@@ -538,26 +433,22 @@ class DexRuntime:
                 if registry["owner"] is None:
                     _method(registry, dex_class, "initAndStart", String, String, String, String).invoke(
                         None, model_path, str(self.detection_confidence),
-                        "gpu" if self.use_gpu else "cpu", self.model_kind
+                        "cpu", self.model_kind
                     )
                 else:
-                    # The process-global Java runtime and hooks survive the short unload/load
-                    # window. Reconfigure the engine and transfer ownership without re-hooking.
+                    # The process-global Java runtime and hooks survive the short unload/load window.
                     ok = self._invoke_reconfigure(
                         registry, dex_class, model_path, self.detection_confidence,
-                        self.use_gpu, self.model_kind,
+                        False, self.model_kind,
                     )
                     if ok is False:
                         raise RuntimeError("hot-reload runtime reconfigure was superseded or failed")
-                    # Re-apply visual settings after a model graph replacement. The
-                    # Java runtime is process-global and may have been initialized by
-                    # an older plugin instance.
                     _method(registry, dex_class, "setMaskMode", String).invoke(None, str(self.mask_mode))
                 registry["owner"] = self.owner_token
                 self.runtime_loader = registry["runtime_loader"]
                 self.core_loader = registry["core_loader"]
                 self.dex_main_class = dex_class
-                self.plugin.log(f"[BlurFaces] Runtime reused from {self.runtime_dir}")
+                self.plugin.log(f"[BlurFaces] Runtime armed from {self.runtime_dir}")
                 return True
         except Exception as error:
             self.plugin.log(f"[BlurFaces] DEX load failed: {error}")
@@ -603,12 +494,40 @@ class DexRuntime:
             if plugin is not None:
                 plugin.log(f"[BlurFaces] Mask mode update failed: {error}")
 
+    def run_privacy_self_test(self, mask_scale=None, mask_mode=None):
+        if mask_scale is None:
+            mask_scale = float(self.face_mask_scale) / 100.0
+        if mask_mode is None:
+            mask_mode = int(self.mask_mode)
+        dex_class = self.dex_main_class
+        if dex_class is None:
+            registry = _runtime_registry()
+            dex_class = registry.get("main_class")
+            if dex_class is None and registry.get("core_loader") is not None:
+                try:
+                    dex_class = registry["core_loader"].loadClass(CLASS_NAME)
+                    registry["main_class"] = dex_class
+                except Exception:
+                    pass
+        if dex_class is None:
+            return "FAILED: Runtime core not loaded"
+        try:
+            registry = _runtime_registry()
+            method = _method(registry, dex_class, "runPrivacySelfTest", Float.TYPE, Integer.TYPE)
+            res = method.invoke(None, Float(jfloat(mask_scale)), Integer(jint(mask_mode)))
+            return str(res)
+        except Exception as error:
+            return f"FAILED: {error}"
+
     @staticmethod
     def reserve_reconfigure_request():
         registry = _runtime_registry()
         with registry["lock"]:
             registry["reconfigure_sequence"] += 1
             return registry["reconfigure_sequence"]
+
+    def switch_confidence(self, detection_confidence, generation, request_generation=None):
+        return self.switch_model(0, detection_confidence, False, generation, request_generation)
 
     def switch_model(self, model_index, detection_confidence, use_gpu, generation, request_generation=None):
         plugin = self.plugin
@@ -638,7 +557,7 @@ class DexRuntime:
             )
             if switched and plugin._is_current(generation):
                 self.model_kind = model_kind
-                plugin.log(f"[BlurFaces] Active model switched to {MODEL_SPECS[model_kind][3]}")
+                plugin.log(f"[BlurFaces] Active model reconfigured to {MODEL_SPECS[model_kind][3]}")
                 return True
             plugin.log(f"[BlurFaces] SWITCH_MODEL returned false switched={switched}")
             return False
@@ -655,20 +574,19 @@ class DexRuntime:
         try:
             method = _method(registry, dex_class, "reconfigure", String, String,
                              String, String, String)
+            return method.invoke(
+                None, model_path, str(detection_confidence),
+                "cpu", model_kind, str(request),
+            )
         except Exception:
-            # Migration from the previous compatible core: its stable switchModel
-            # remains usable until the process naturally adopts this release's core.
             method = _method(registry, dex_class, "switchModel", String, String,
                              String, String)
             result = method.invoke(
                 None, model_path, str(detection_confidence),
-                "gpu" if use_gpu else "cpu", model_kind,
+                "cpu", model_kind,
             )
             return True if result is None else bool(result)
-        return method.invoke(
-            None, model_path, str(detection_confidence),
-            "gpu" if use_gpu else "cpu", model_kind, str(request),
-        )
+
     def unload(self, deferred=True):
         dex_class = self.dex_main_class
         logger_proxy = self.logger_proxy
