@@ -147,6 +147,11 @@ bool verify_head_chrominance(const unsigned char* rgba, int img_w, int img_h,
     float chroma_dist = std::sqrt(d_cr * d_cr + d_cb * d_cb);
     if (chroma_dist < 2.85f) return false;
 
+    // Real human heads have hair, clothing/collar, eyes and background (skin rarely exceeds 75%).
+    // Monolithic sheets of brown kraft cardboard / wood veneer have 85% - 97% uniform "skin" color.
+    float box_area = (xmax - xmin) * (ymax - ymin);
+    if (skin_ratio > 0.82f && box_area > 0.08f) return false;
+
     if (feature_idx == 0) {
         if (skin_ratio < 0.18f || cr_mean < 130.5f || rb_diff < 1) return false;
     } else if (feature_idx == 1) {
