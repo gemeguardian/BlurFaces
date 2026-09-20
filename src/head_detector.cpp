@@ -90,11 +90,15 @@ bool verify_head_chrominance(const unsigned char* rgba, int img_w, int img_h,
 
     int skin_hits = 0;
     int center_skin_hits = 0;
+    int top_skin_hits = 0;
     int yellow_hits = 0;
     int sum_cb = 0;
     int sum_cr = 0;
     int sum_r = 0;
+    int sum_g = 0;
     int sum_b = 0;
+    int sum_lum = 0;
+    int center_sum_lum = 0;
     int min_lum = 255;
     int max_lum = 0;
     constexpr int total_samples = kGrid * kGrid;
@@ -112,6 +116,11 @@ bool verify_head_chrominance(const unsigned char* rgba, int img_w, int img_h,
             int lum = (r * 77 + g * 150 + b * 29) >> 8;
             if (lum < min_lum) min_lum = lum;
             if (lum > max_lum) max_lum = lum;
+            sum_lum += lum;
+
+            if (j >= 3 && j <= 6 && i >= 3 && i <= 6) {
+                center_sum_lum += lum;
+            }
 
             // Integer fixed-point ITU-R BT.601 YCbCr conversion
             int cb = 128 + ((-43 * r - 85 * g + 128 * b) >> 8);
@@ -120,6 +129,7 @@ bool verify_head_chrominance(const unsigned char* rgba, int img_w, int img_h,
             sum_cb += cb;
             sum_cr += cr;
             sum_r += r;
+            sum_g += g;
             sum_b += b;
 
             // Artificial saturated yellow / amber (ceramics, mugs, plastic, beer)
@@ -132,6 +142,9 @@ bool verify_head_chrominance(const unsigned char* rgba, int img_w, int img_h,
             // Excludes near-neutral gray/black objects (chairs, clothes, cushions)
             if (cb >= 77 && cb <= 127 && cr >= 133 && cr <= 173 && (r > b)) {
                 skin_hits++;
+                if (j <= 3) {
+                    top_skin_hits++;
+                }
                 if (j >= 3 && j <= 6 && i >= 3 && i <= 6) {
                     center_skin_hits++;
                 }
@@ -157,14 +170,26 @@ bool verify_head_chrominance(const unsigned char* rgba, int img_w, int img_h,
     float chroma_dist = std::sqrt(d_cr * d_cr + d_cb * d_cb);
     if (chroma_dist < 2.85f) return false;
 
-    // Real human heads have skin across the central facial core (nose, cheeks, mouth).
-    // Inanimate clothes hangers / coat silhouettes only have peripheral skin locus hits from walls or hanger edges.
-    float box_area = (xmax - xmin) * (ymax - ymin);
-    if (feature_idx == 0 || box_area > 0.15f) {
-        if (center_skin_hits < 3) return false;
-    } else {
-        if (center_skin_hits < 1) return false;
+    // Real human heads have contiguous facial skin across the central core (cheeks, nose, mouth).
+    // In human selfie video notes, center_skin_hits is >= 8 out of 16 (dataset min 9, mean 15.75).
+    // Dog body/torso/rump false positives have dark steel/black saddle or fur boundaries in center (< 8 hits).
+    if (center_skin_hits < 8) return false;
+
+    // Top skin check: human head upper quadrant contains forehead skin (dataset min 2, mean 20.0).
+    // Dog nose tips and dark pet backs contain zero skin locus hits in the upper 3 rows (< 2 hits).
+    if (top_skin_hits < 2) return false;
+
+    float box_lum_mean = static_cast<float>(sum_lum) / total_samples;
+    float center_lum_mean = static_cast<float>(center_sum_lum) / 16.0f;
+
+    // Canine dark-snout vs illuminated human facial core check:
+    // A human facial core is prominently illuminated (center_lum_mean / box_lum_mean >= 0.66).
+    // When a pet dog looks up surrounded by bright beige floor tiles, the center is a dark snout (< 55% of box mean).
+    if (box_lum_mean > 45.0f && (center_lum_mean / box_lum_mean) < 0.55f) {
+        return false;
     }
+
+    float box_area = (xmax - xmin) * (ymax - ymin);
 
     // Real close-up faces (where hair/collar is out of frame) have high skin ratio (82% - 98%).
     // Unlike flat cardboard sheets or wood veneer, real faces contain high-contrast facial
@@ -348,6 +373,13 @@ int HeadDetector::detect(const unsigned char* rgba_pixels, int width, int height
                         float bbox_h = std::exp(*hptr) * bias_h / static_cast<float>(kInputH);
 
                         float prob = sigmoid(box_score);
+
+                        // Medium-scale F1 A1 anchor (96x120): true human heads in this scale always exhibit
+                        // sharp confidence >= 0.66 (mean 0.98). Suppress ambiguous pet/fur proposals (< 0.50).
+                        if (feature_idx == 1 && anchor_idx == 1 && prob < 0.50f) {
+                            xptr++; yptr++; wptr++; hptr++; score_ptr++;
+                            continue;
+                        }
 
                         float xmin = std::max(0.0f, std::min(1.0f, bbox_cx - bbox_w * 0.5f));
                         float ymin = std::max(0.0f, std::min(1.0f, bbox_cy - bbox_h * 0.5f));
