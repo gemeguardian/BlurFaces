@@ -71,6 +71,68 @@ inline float compute_texture_energy(const ncnn::Mat& img, const HeadBox& box) {
     return sum_grad / (kSamples * kSamples);
 }
 
+// Fast fixed-point chrominance validation to reject achromatic macro-hallucinations (knees, pants, floors)
+bool verify_head_chrominance(const unsigned char* rgba, int img_w, int img_h,
+                             float xmin, float ymin, float xmax, float ymax,
+                             int feature_idx) {
+    int ix0 = std::clamp(static_cast<int>(xmin * img_w), 0, img_w - 1);
+    int iy0 = std::clamp(static_cast<int>(ymin * img_h), 0, img_h - 1);
+    int ix1 = std::clamp(static_cast<int>(xmax * img_w), 0, img_w - 1);
+    int iy1 = std::clamp(static_cast<int>(ymax * img_h), 0, img_h - 1);
+
+    int box_w = ix1 - ix0;
+    int box_h = iy1 - iy0;
+    if (box_w < 4 || box_h < 4) return true;
+
+    constexpr int kGrid = 8;
+    float step_x = static_cast<float>(box_w) / (kGrid + 1);
+    float step_y = static_cast<float>(box_h) / (kGrid + 1);
+
+    int skin_hits = 0;
+    int sum_cr = 0;
+    int sum_r = 0;
+    int sum_b = 0;
+    constexpr int total_samples = kGrid * kGrid;
+
+    for (int j = 1; j <= kGrid; ++j) {
+        int y = iy0 + static_cast<int>(j * step_y);
+        const unsigned char* row = rgba + y * img_w * 4;
+        for (int i = 1; i <= kGrid; ++i) {
+            int x = ix0 + static_cast<int>(i * step_x);
+            const unsigned char* p = row + x * 4;
+            int r = p[0];
+            int g = p[1];
+            int b = p[2];
+
+            // Integer fixed-point ITU-R BT.601 YCbCr conversion
+            int cb = 128 + ((-43 * r - 85 * g + 128 * b) >> 8);
+            int cr = 128 + ((128 * r - 107 * g - 21 * b) >> 8);
+
+            sum_cr += cr;
+            sum_r += r;
+            sum_b += b;
+
+            if (cb >= 77 && cb <= 127 && cr >= 133 && cr <= 173) {
+                skin_hits++;
+            }
+        }
+    }
+
+    float skin_ratio = static_cast<float>(skin_hits) / total_samples;
+    float cr_mean = static_cast<float>(sum_cr) / total_samples;
+    int rb_diff = (sum_r - sum_b) / total_samples;
+
+    if (feature_idx == 0) {
+        if (skin_ratio < 0.18f || cr_mean < 130.0f || rb_diff < 1) return false;
+    } else if (feature_idx == 1) {
+        if (skin_ratio < 0.12f || cr_mean < 129.5f || rb_diff < 0) return false;
+    } else {
+        if (skin_ratio < 0.25f || cr_mean < 132.0f || rb_diff < 1) return false;
+    }
+
+    return true;
+}
+
 void nms(std::vector<HeadBox>& candidates, std::vector<HeadBox>& picked, float threshold) {
     picked.clear();
     std::sort(candidates.begin(), candidates.end(), [](const HeadBox& a, const HeadBox& b) {
@@ -250,6 +312,10 @@ int HeadDetector::detect(const unsigned char* rgba_pixels, int width, int height
                             }
                             float aspect = bw / bh;
                             if (aspect >= 0.45f && aspect <= 1.60f) {
+                                if (!verify_head_chrominance(rgba_pixels, width, height, xmin, ymin, xmax, ymax, feature_idx)) {
+                                    xptr++; yptr++; wptr++; hptr++; score_ptr++;
+                                    continue;
+                                }
                                 HeadBox box;
                                 box.x1 = xmin;
                                 box.y1 = ymin;
