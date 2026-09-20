@@ -1247,37 +1247,6 @@ public final class Main {
         }
     }
 
-    private static long lastDebugFrameSavedNanos = 0L;
-    private static void maybeSaveDebugFrame(ByteBuffer rgba, float score, float cx, float cy) {
-        long now = System.nanoTime();
-        if (now - lastDebugFrameSavedNanos < 400_000_000L) return; // rate-limit: max 2.5 fps
-        lastDebugFrameSavedNanos = now;
-        try {
-            java.io.File dir = new java.io.File("/storage/emulated/0/Download/BlurFacesDebug");
-            if (!dir.exists()) dir.mkdirs();
-            ByteBuffer copy = ByteBuffer.allocateDirect(rgba.capacity());
-            rgba.position(0);
-            copy.put(rgba);
-            rgba.position(0);
-            copy.position(0);
-            new Thread(() -> {
-                try {
-                    android.graphics.Bitmap bmp = android.graphics.Bitmap.createBitmap(
-                            CleanFrameTap.SIZE, CleanFrameTap.SIZE, android.graphics.Bitmap.Config.ARGB_8888);
-                    bmp.copyPixelsFromBuffer(copy);
-                    long ts = System.currentTimeMillis();
-                    java.io.File file = new java.io.File(dir, String.format(java.util.Locale.US,
-                            "det_%d_s%d_y%d.jpg", ts, (int)(score * 100), (int)(cy * 100)));
-                    try (java.io.FileOutputStream out = new java.io.FileOutputStream(file)) {
-                        bmp.compress(android.graphics.Bitmap.CompressFormat.JPEG, 92, out);
-                    }
-                    bmp.recycle();
-                    emit("Saved clean debug frame: " + file.getName());
-                } catch (Throwable ignored) { }
-            }).start();
-        } catch (Throwable ignored) { }
-    }
-
     private static void submitLatestFrame() {
         CapturedFrame frame = LATEST_FRAME.getAndSet(null);
         if (frame == null) { DRAIN_SCHEDULED.set(false); return; }
@@ -1298,10 +1267,6 @@ public final class Main {
 
             int count = NativeBridge.process(frame.rgba, CleanFrameTap.SIZE, CleanFrameTap.SIZE,
                     outGeometry, outScores, outYaws, MAX_FACES, configuredConfidence);
-
-            if (count > 0 && outScores != null) {
-                maybeSaveDebugFrame(frame.rgba, outScores[0], outGeometry[0], outGeometry[1]);
-            }
 
             FaceGeometry detections = new FaceGeometry(outGeometry, outScores, outYaws, count,
                     frame.captureNanos, frame.sourceKey);
@@ -1945,30 +1910,6 @@ public final class Main {
             if (state.fallbackProgram != 0) GLES20.glDeleteProgram(state.fallbackProgram);
             if (state.fallbackTexture != 0) GLES20.glDeleteTextures(1, new int[]{state.fallbackTexture}, 0);
             state.program = state.fallbackProgram = state.fallbackTexture = 0;
-            try {
-                Object outer = field(owner.getClass(), "this$0").get(owner);
-                java.io.File cameraFile = (java.io.File) field(outer.getClass(), "cameraFile").get(outer);
-                if (cameraFile != null) {
-                    final java.io.File src = cameraFile;
-                    new Thread(() -> {
-                        try {
-                            Thread.sleep(600);
-                            if (src.exists() && src.length() > 0) {
-                                java.io.File dir = new java.io.File("/storage/emulated/0/Download/BlurFacesDebug");
-                                if (!dir.exists()) dir.mkdirs();
-                                java.io.File dst = new java.io.File(dir, "round_" + System.currentTimeMillis() + ".mp4");
-                                try (java.io.FileInputStream in = new java.io.FileInputStream(src);
-                                     java.io.FileOutputStream out = new java.io.FileOutputStream(dst)) {
-                                    byte[] buf = new byte[65536];
-                                    int len;
-                                    while ((len = in.read(buf)) > 0) out.write(buf, 0, len);
-                                }
-                                emit("Saved copy of recorded round video to: " + dst.getName());
-                            }
-                        } catch (Throwable ignored) { }
-                    }).start();
-                }
-            } catch (Throwable ignored) { }
         }
     }
 
