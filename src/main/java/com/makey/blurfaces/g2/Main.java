@@ -794,12 +794,18 @@ public final class Main {
         ENCODER_SWITCH_BARRIER_FRAMES.set(0);
         NativeBridge.reset();
         SOURCE_TRACKS.clear();
+        CapturedFrame stale = LATEST_FRAME.getAndSet(null);
+        if (stale != null) {
+            FRAME_POOL.offer(stale.rgba);
+            releaseFirstDetectionLatch(stale.sourceKey);
+        }
         clearFirstDetectionLatches();
         synchronized (CAMERA_STATES) {
             for (CameraState state : CAMERA_STATES.values()) {
                 if (blurEnabled) {
                     state.faceCount = -1;
                     state.blurTexture = 0;
+                    java.util.Arrays.fill(state.faces, 0f);
                 }
             }
         }
@@ -808,6 +814,7 @@ public final class Main {
                 if (blurEnabled) {
                     state.faceCount = -1;
                     state.blurTexture = 0;
+                    java.util.Arrays.fill(state.faces, 0f);
                 }
             }
         }
@@ -882,7 +889,11 @@ public final class Main {
             FaceGeometry geometry = geometryFor(source, now);
             state.faceCount = geometry == null ? resolveFaceCount(source, now) : geometry.count;
             if (previewTransitionActive(thread)) state.faceCount = -1;
-            if (geometry != null) System.arraycopy(geometry.faces, 0, state.faces, 0, geometry.count * FACE_STRIDE);
+            if (geometry != null) {
+                System.arraycopy(geometry.faces, 0, state.faces, 0, geometry.count * FACE_STRIDE);
+            } else if (state.faceCount <= 0) {
+                java.util.Arrays.fill(state.faces, 0f);
+            }
             float minFaceRadius = 0.20f;
             if (state.faceCount > 0) {
                 for (int i = 0; i < state.faceCount; i++) {
@@ -1058,6 +1069,7 @@ public final class Main {
     private static void captureUpdatedSurface(Object thread, SurfaceTexture surface, int slot) {
         CameraState state = cameraState(thread);
         long now = System.nanoTime();
+        if (now - LAST_CAMERA_SWITCH_NANOS.get() < 250_000_000L) return;
         ByteBuffer frameBuffer = null;
         String source = null;
         try {
@@ -1266,6 +1278,13 @@ public final class Main {
     private static void submitLatestFrame() {
         CapturedFrame frame = LATEST_FRAME.getAndSet(null);
         if (frame == null) { DRAIN_SCHEDULED.set(false); return; }
+        if (frame.captureNanos < LAST_CAMERA_SWITCH_NANOS.get() + 250_000_000L) {
+            releaseFirstDetectionLatch(frame.sourceKey);
+            FRAME_POOL.offer(frame.rgba);
+            DRAIN_SCHEDULED.set(false);
+            if (acceptingFrames && LATEST_FRAME.get() != null) scheduleDrain();
+            return;
+        }
         try {
             long inferenceStart = System.nanoTime();
             frame.rgba.position(0);
@@ -1450,6 +1469,8 @@ public final class Main {
             if (encoderTransitionActive(renderer)) state.faceCount = -1;
             if (geometry != null && state.faceCount > 0) {
                 System.arraycopy(geometry.faces, 0, state.faces, 0, geometry.count * FACE_STRIDE);
+            } else if (state.faceCount <= 0) {
+                java.util.Arrays.fill(state.faces, 0f);
             }
             float minFaceRadius = 0.20f;
             if (state.faceCount > 0) {
@@ -1604,6 +1625,7 @@ public final class Main {
     }
 
     private static boolean previewTransitionActive(Object thread) {
+        if (System.nanoTime() - LAST_CAMERA_SWITCH_NANOS.get() < 300_000_000L) return true;
         if (CAMERA_SWITCH_BARRIER_FRAMES.get() < CAMERA_SWITCH_BARRIER_MIN_FRAMES) return true;
         try {
             Object outer = field(thread.getClass(), "this$0").get(thread);
@@ -1625,6 +1647,7 @@ public final class Main {
     }
 
     private static boolean encoderTransitionActive(Object renderer) {
+        if (System.nanoTime() - LAST_CAMERA_SWITCH_NANOS.get() < 300_000_000L) return true;
         if (ENCODER_SWITCH_BARRIER_FRAMES.get() < CAMERA_SWITCH_BARRIER_MIN_FRAMES) return true;
         try {
             Object outer = field(renderer.getClass(), "this$0").get(renderer);
