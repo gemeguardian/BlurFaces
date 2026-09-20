@@ -9,7 +9,7 @@ from .runtime import DexRuntime
 
 
 ROUND_VIDEO_WIDTHS = (0, 320, 384, 448, 512)
-FACE_MASK_SCALES = (65, 82, 100)
+FACE_MASK_SCALE = 100
 DETECTION_CONFIDENCES = (45, 35, 25)
 MASK_MODES = (0, 1, 2)
 
@@ -19,7 +19,6 @@ class BlurFacesPlugin(BasePlugin):
         super().__init__()
         self.enabled = True
         self.round_video_width_index = 0
-        self.face_mask_index = 2
         self.detection_range_index = 0
         self.mask_mode_index = 0
         self.dex_loader = None
@@ -32,7 +31,6 @@ class BlurFacesPlugin(BasePlugin):
         self._loaded = True
         self.enabled = bool(self.get_setting("enabled", True))
         self.round_video_width_index = 0
-        self.face_mask_index = self._valid_mask_index(self.get_setting("face_mask_size", 2))
         self.detection_range_index = self._valid_range_index(
             self.get_setting("detection_range", 0)
         )
@@ -51,7 +49,7 @@ class BlurFacesPlugin(BasePlugin):
             runtime = DexRuntime(
                 plugin=self,
                 round_video_width=ROUND_VIDEO_WIDTHS[self.round_video_width_index],
-                face_mask_scale=FACE_MASK_SCALES[self.face_mask_index],
+                face_mask_scale=FACE_MASK_SCALE,
                 detection_confidence=DETECTION_CONFIDENCES[self.detection_range_index],
             )
             if not runtime.stage_and_start():
@@ -85,11 +83,6 @@ class BlurFacesPlugin(BasePlugin):
 
     def create_settings(self):
         self._loaded = True
-        mask_items = [
-            strings.get("mask_compact"),
-            strings.get("mask_standard"),
-            strings.get("mask_wide"),
-        ]
         return [
             Header(strings.get("settings_header")),
             Switch(
@@ -113,15 +106,6 @@ class BlurFacesPlugin(BasePlugin):
             ),
             Divider(text=strings.get("settings_mask_mode_subtext")),
             Selector(
-                key="face_mask_size",
-                text=strings.get("settings_mask"),
-                icon="msg_view_file",
-                default=self.face_mask_index,
-                items=mask_items,
-                on_change=self._on_mask_change,
-            ),
-            Divider(text=strings.get("settings_mask_subtext")),
-            Selector(
                 key="detection_range",
                 text=strings.get("settings_range"),
                 icon="msg_search",
@@ -143,14 +127,6 @@ class BlurFacesPlugin(BasePlugin):
         except (TypeError, ValueError):
             return 0
         return index if 0 <= index < len(ROUND_VIDEO_WIDTHS) else 0
-
-    @staticmethod
-    def _valid_mask_index(value):
-        try:
-            index = int(value)
-        except (TypeError, ValueError):
-            return 2
-        return index if 0 <= index < len(FACE_MASK_SCALES) else 2
 
     @staticmethod
     def _valid_range_index(value):
@@ -189,16 +165,6 @@ class BlurFacesPlugin(BasePlugin):
             run_on_queue(lambda: runtime.set_round_video_width(width))
         label = "app default" if width == 0 else f"{width}x{width}"
         self.log(f"[BlurFaces] Round-video resolution: {label}; applies when camera opens next")
-
-    def _on_mask_change(self, value):
-        index = self._valid_mask_index(value)
-        self.face_mask_index = index
-        self.set_setting("face_mask_size", index)
-        scale = FACE_MASK_SCALES[index]
-        runtime = self.dex_loader
-        if runtime:
-            run_on_queue(lambda: runtime.set_face_mask_scale(scale))
-        self.log(f"[BlurFaces] Face mask scale: {scale}%")
 
     def _on_mask_mode_change(self, value):
         index = self._valid_mask_mode_index(value)

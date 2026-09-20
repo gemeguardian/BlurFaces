@@ -56,9 +56,10 @@ selector_calls = [
     and isinstance(node.func, ast.Name)
     and node.func.id == "Selector"
 ]
-assert len(selector_calls) == 3
+assert len(selector_calls) == 2
 assert all("subtext" not in {keyword.arg for keyword in call.keywords} for call in selector_calls)
 assert 'key="detection_range"' in main_source
+assert 'key="mask_mode"' in main_source
 assert "DexRuntime" in main_source
 assert "from .asset_hashes import ASSET_HASHES" in runtime_source
 assert "http://" not in runtime_source
