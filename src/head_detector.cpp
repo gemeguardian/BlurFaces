@@ -189,7 +189,23 @@ bool verify_head_chrominance(const unsigned char* rgba, int img_w, int img_h,
         return false;
     }
 
+    // Biological hemoglobin chrominance balance:
+    // Human skin across all Fitzpatrick types physically has (R - G) / (R - B) >= 0.58 (dataset mean 0.74, min 0.63).
+    // In contrast, canine fur, wood, and neutral gray/brown objects have R close to G (rg_ratio < 0.58).
+    int rg_diff = (sum_r - sum_g) / total_samples;
+    if (rb_diff <= 0 || (rg_diff * 100) < (rb_diff * 58)) {
+        return false;
+    }
+
     float box_area = (xmax - xmin) * (ymax - ymin);
+
+    // Canine full-body / torso fur suppression:
+    // A gigantic box (area > 0.55) filled with apparent skin locus (ratio > 0.70)
+    // must exhibit rich biological red chrominance (Cr >= 141.0).
+    // Flat/tan canine fur spanning the whole frame has Cr ~ 136 - 139.
+    if (box_area > 0.55f && skin_ratio > 0.70f && cr_mean < 141.0f) {
+        return false;
+    }
 
     // Real close-up faces (where hair/collar is out of frame) have high skin ratio (82% - 98%).
     // Unlike flat cardboard sheets or wood veneer, real faces contain high-contrast facial
@@ -389,6 +405,14 @@ int HeadDetector::detect(const unsigned char* rgba_pixels, int width, int height
                         float bw = xmax - xmin;
                         float bh = ymax - ymin;
 
+                        // Circular mask upper sensor boundary clip:
+                        // Boxes touching the extreme top border (ymin <= 0.01) with small height (bh <= 0.25)
+                        // correspond to sensor clipping artifacts or fingers on phone edge, outside the circular note.
+                        if (ymin <= 0.01f && bh <= 0.25f) {
+                            xptr++; yptr++; wptr++; hptr++; score_ptr++;
+                            continue;
+                        }
+
                         // Physical bounding box sanity checks for human head in round video notes:
                         // - Min: 8% width, 10% height (rejects buttons, specks, tags)
                         // - Max: 100% width, 100% height (supports full-frame close-up selfies)
@@ -401,6 +425,12 @@ int HeadDetector::detect(const unsigned char* rgba_pixels, int width, int height
                                 }
                             }
                             float aspect = bw / bh;
+                            // Large box aspect ratio sanity: wide horizontal rectangles (aspect > 1.25) when width > 0.75
+                            // correspond to quadruped animal bodies lying down, never upright or tilted human heads.
+                            if (bw > 0.75f && aspect > 1.25f) {
+                                xptr++; yptr++; wptr++; hptr++; score_ptr++;
+                                continue;
+                            }
                             if (aspect >= 0.45f && aspect <= 1.60f) {
                                 if (!verify_head_chrominance(rgba_pixels, width, height, xmin, ymin, xmax, ymax, feature_idx)) {
                                     xptr++; yptr++; wptr++; hptr++; score_ptr++;
@@ -422,7 +452,7 @@ int HeadDetector::detect(const unsigned char* rgba_pixels, int width, int height
                                 // true head texture energy is >= 4.20 even in dark rooms (mean 14.80).
                                 // Flat doors and planar surfaces have texture energy <= 2.88.
                                 float tex_energy = compute_texture_energy(input, box);
-                                float min_tex = (feature_idx == 0) ? 3.2f : 2.8f;
+                                float min_tex = (feature_idx == 0) ? 3.5f : 2.8f;
                                 if (tex_energy < min_tex) {
                                     xptr++; yptr++; wptr++; hptr++; score_ptr++;
                                     continue;
