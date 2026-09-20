@@ -1,4 +1,4 @@
-plugin_description: "Offline 360° head and face blur via NCNN + ByteTrack for round-camera preview and recorded video."
+plugin_description: "Automatically hides faces and heads in round video messages in real time."
 settings_header: "Face Protection"
 settings_enabled: "Face blur"
 settings_enabled_subtext: "Hides faces and heads in both preview and recorded message"

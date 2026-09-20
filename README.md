@@ -1,54 +1,54 @@
-# BlurFaces
+# BlurFaces v3.0.0
 
 <div align="center">
 
-**Real-Time, Zero-Network Privacy Shield for exteraGram / Telegram Android**
+**Умная защита приватности для круглых видеосообщений в Telegram / exteraGram**
 
 [![Build](https://img.shields.io/badge/build-passing-brightgreen.svg)]()
 [![Platform](https://img.shields.io/badge/platform-Android%20%7C%20ARM64--v8a-blue.svg)]()
-[![Inference](https://img.shields.io/badge/engine-Tencent%20NCNN-orange.svg)]()
-[![Code Size](https://img.shields.io/badge/code%20size-413%20KB%20%7C%209.1k%20LoC-informational.svg)]()
+[![AI Model](https://img.shields.io/badge/AI-YOLOv8n--Head-orange.svg)]()
 [![Bundle Size](https://img.shields.io/badge/bundle-2.0%20MB-purple.svg)]()
-[![Privacy](https://img.shields.io/badge/policy-100%25%20Offline%20%7C%20Fail--Closed-red.svg)]()
+[![Privacy](https://img.shields.io/badge/privacy-On--Device%20Inference-green.svg)]()
 
 </div>
 
 ---
 
-## Highlights
+## 🎭 Что это такое?
 
-- **100% Offline & Private**: Zero external dependencies, zero network requests. All weights and native libraries are bundled within the `.elyx` package.
-- **Fail-Closed Guarantee**: Before detection stabilizes or across instant camera switches, full-frame privacy blur guards the sensor stream.
-- **Sub-12ms Inference**: High-performance Tencent NCNN C++ pipeline with ARM64 NEON FP16 SIMD optimizations.
-- **Extreme Low-Light Resilience**: Adaptive logit prior ($\beta(\mu)$), dynamic gray-world reference, Weber-normalized 3D relief verification, and preprocessor gain scaling.
-- **Robust Multi-Object Tracking**: ByteTrack 2-stage association with decoupled Kalman filtering and coasting protection.
-- **Native UI Integration**: Integrated round-video pill control with live haptic feedback, theme synchronization, and dynamic SVG vector icon packs.
+**BlurFaces** — это плагин для exteraGram (клиента Telegram на Android), который автоматически находит и скрывает лица и головы людей в реальном времени при записи видеосообщений («кружков») и в окне камеры.
+
+Больше не нужно переживать, что в кадр случайно попадут случайные прохожие, домашние или вы сами, если хотите сохранить анонимность.
 
 ---
 
-## Architecture
+## ✨ Ключевые возможности
 
-```
-[ Camera OES Texture ] 
-         │
-         ▼
-[ CleanFrameTap (GLSL) ] ──▶ Double-Buffered Async PBO
-         │
-         ▼
-[ Native C++ Engine (libblur_faces.so) ]
-   ├── NCNN FPN Head Detector (320x320 FP16)
-   ├── Biological Evidence Fusion & Veto Filters
-   └── ByteTrack Multi-Object Kalman Tracking
-         │
-         ▼
-[ Camera / Encoder Shaders ] ──▶ Smooth Mask Rendering (Blur / Pixelate / Solid)
-```
+- 🧠 **Современная нейросеть YOLOv8n**: плагин использует обученную модель детекции голов с 3 миллионами параметров. Она отлично понимает анатомию человека и больше не путает головы с гантелями, рюкзаками, чашками или узорами на полу.
+- 🔄 **Защита на все 360°**: в отличие от обычных детекторов лиц, модель видит голову под любым углом — в профиль, с затылка, при наклоне или повороте.
+- ⚡ **Молниеносная скорость (8–10 мс)**: инференс работает прямо на процессоре устройства через оптимизированный движок Tencent NCNN с инструкциями ARM NEON. Картинка в камере не тормозит и не дёргается (стабильные 30–60 FPS).
+- 🎯 **Умный трекинг ByteTrack**: даже при быстром движении или резких взмахах камеры маска мягко и неотрывно следует за головой без мерцания и рывков.
+- 🎨 **3 стиля защиты на выбор**:
+  - **Гауссово размытие** — мягкое, аккуратное и кинематографичное скрытие.
+  - **Пикселизация** — классическая «мозаика», гарантирующая 100% сокрытие черт лица.
+  - **Сплошная маска** — максимальная защита тёмным овалом.
+- 📦 **Вес всего 2.0 МБ**: сам плагин весит минимум. Веса нейросети скачиваются один раз при первом включении напрямую из официального репозитория, а при удалении плагина удаляются автоматически и без следа.
+- 🔒 **Полная приватность**: видеопоток никогда не покидает ваше устройство. Вся обработка кадров происходит локально в оперативной памяти телефона.
 
 ---
 
-## Building
+## 🛠 Установка
 
-### Requirements
+1. Скачайте файл `blur_faces-3.0.0.elyx`.
+2. Откройте его в **exteraGram** и подтвердите установку.
+3. Перейдите в **Настройки exteraGram ➔ Плагины ➔ Blur Faces** и включите плагин.
+4. При первом запуске плагин автоматически загрузит веса модели (~5.7 МБ) и сразу будет готов к работе.
+
+---
+
+## ⚙️ Сборка из исходников
+
+Для самостоятельной сборки потребуется:
 - JDK 17+
 - Android NDK (r25c+)
 - `elyb` (ElyxBuilder)
@@ -57,20 +57,12 @@
 ./build.sh
 ```
 
-The output package will be generated at:
-```
-builds/blur_faces-3.0.0.elyx
-```
+Готовый файл плагина появится в каталоге `builds/blur_faces-3.0.0.elyx`.
 
 ---
 
-## Verification
+## 🧪 Тестирование
 
 ```bash
-# Run pytest contracts
-pytest tests/tests_*.py
-
-# Run tracking and elyx packaging contracts
-python3 tests/tests_tracking_behavior.py
-python3 tests/tests_elyx_contract.py
+python3 -m unittest discover -s tests -p "tests_*.py"
 ```
