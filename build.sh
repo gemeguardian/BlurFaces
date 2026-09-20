@@ -59,4 +59,5 @@ cd "$ROOT_DIR"
 ./gradlew clean buildDex
 python3 build.py
 "$BUILDER" build --ast --verbose --no-folder
+python3 scripts/fix_zip_perms.py
 python3 scripts/update_stats.py

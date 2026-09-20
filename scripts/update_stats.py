@@ -24,6 +24,9 @@ def get_code_stats():
     return total_bytes, total_lines
 
 def get_bundle_stats():
+    zip_path = ROOT / "builds" / "blur_faces-3.0.0.elyx"
+    if zip_path.exists():
+        return zip_path.stat().st_size
     builds_dir = ROOT / "builds"
     elyx_files = sorted(builds_dir.glob("blur_faces-*.elyx"), key=lambda p: p.stat().st_mtime, reverse=True)
     if not elyx_files:

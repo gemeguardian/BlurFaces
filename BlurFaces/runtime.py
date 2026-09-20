@@ -247,22 +247,33 @@ def _ensure_runtime_loaders(context, registry, logger=None):
     runtime_dir = os.path.join(root, "runtime_" + RUNTIME_BUNDLE_ID)
     core_dir = os.path.join(root, "core_" + CORE_BUNDLE_ID)
     native_dir = os.path.join(runtime_dir, "jni", "arm64-v8a")
-    model_dir = os.path.join(root, "models")
     os.makedirs(native_dir, exist_ok=True)
-    os.makedirs(model_dir, exist_ok=True)
     core_path = _stage_asset("dex/core.dex", os.path.join(core_dir, "core.dex"), True)
     so_path = _stage_asset(
         "jni/arm64-v8a/libblur_faces.so",
         os.path.join(native_dir, "libblur_faces.so"), True,
     )
-    _stage_asset(
-        "model/head_det.param",
-        os.path.join(model_dir, "head_det.param"), True,
-    )
+
+    # Store model in the plugin's own folder so it is automatically removed upon plugin deletion
+    try:
+        param_asset = assets.get("model/head_det.param")
+        model_dir = os.path.dirname(param_asset.path_str) if param_asset else os.path.join(root, "models")
+    except Exception:
+        model_dir = os.path.join(root, "models")
+    os.makedirs(model_dir, exist_ok=True)
+
     _download_model_bin(
         os.path.join(model_dir, "head_det.bin"),
         logger=logger,
     )
+
+    # Clean legacy duplicate model files from app_blur_faces_runtime_v3 if present
+    legacy_model_dir = os.path.join(root, "models")
+    if os.path.isdir(legacy_model_dir):
+        try:
+            shutil.rmtree(legacy_model_dir)
+        except OSError:
+            pass
 
     opt = context.getDir("blur_faces_dex_opt_v3", 0).getCanonicalPath()
     parent = context.getClassLoader()
@@ -291,8 +302,18 @@ def _ensure_runtime_loaders(context, registry, logger=None):
 
 def cached_model_path(context, logger=None):
     root = context.getDir("blur_faces_runtime_v3", 0).getCanonicalPath()
-    param_path = os.path.join(root, "models", "head_det.param")
-    bin_path = os.path.join(root, "models", "head_det.bin")
+    try:
+        param_asset = assets.get("model/head_det.param")
+        param_path = param_asset.path_str if param_asset else None
+    except Exception:
+        param_path = None
+    if not param_path or not os.path.isfile(param_path):
+        param_path = os.path.join(root, "models", "head_det.param")
+        if not os.path.isfile(param_path):
+            _stage_asset("model/head_det.param", param_path, True)
+
+    model_dir = os.path.dirname(param_path)
+    bin_path = os.path.join(model_dir, "head_det.bin")
     if (os.path.isfile(param_path) and _sha256(param_path) == ASSET_HASHES["model/head_det.param"]
             and os.path.isfile(bin_path) and _sha256(bin_path) == MODEL_BIN_SHA256):
         return param_path
