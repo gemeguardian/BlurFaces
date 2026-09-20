@@ -7,7 +7,7 @@
 [![Build](https://img.shields.io/badge/build-passing-brightgreen.svg)]()
 [![Platform](https://img.shields.io/badge/platform-Android%20%7C%20ARM64--v8a-blue.svg)]()
 [![Inference](https://img.shields.io/badge/engine-Tencent%20NCNN-orange.svg)]()
-[![Code Size](https://img.shields.io/badge/code%20size-422%20KB%20%7C%209.3k%20LoC-informational.svg)]()
+[![Code Size](https://img.shields.io/badge/code%20size-417%20KB%20%7C%209.1k%20LoC-informational.svg)]()
 [![Bundle Size](https://img.shields.io/badge/bundle-4.5%20MB-purple.svg)]()
 [![Privacy](https://img.shields.io/badge/policy-100%25%20Offline%20%7C%20Fail--Closed-red.svg)]()
 

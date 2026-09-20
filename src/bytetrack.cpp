@@ -81,14 +81,12 @@ void STrack::predict() {
     float q00 = q_pos * q_pos;
     float q11 = q_vel * q_vel;
 
-    // Decay velocity and gently expand bounding box if coasting in lost state
+    // Decay velocity if coasting in lost state
     if (state_ == TrackState::Lost) {
         kf_cx_.v *= 0.85f;
         kf_cy_.v *= 0.85f;
         kf_h_.v *= 0.85f;
         kf_a_.v *= 0.85f;
-        // Coasting expansion (+2.5% per frame up to 1.32x max) for fail-closed coverage
-        kf_h_.x = std::min(1.0f, kf_h_.x * 1.025f);
     }
 
     kf_cx_.predict(q00, 0.0f, 0.0f, q11);
@@ -325,7 +323,7 @@ void ByteTracker::linear_assignment(const std::vector<HeadBox>& detections,
 }
 
 std::vector<STrack> ByteTracker::update(const std::vector<HeadBox>& detections) {
-    return update(detections, high_thresh_, low_thresh_, std::max(0.60f, std::min(0.85f, high_thresh_ + 0.25f)));
+    return update(detections, high_thresh_, low_thresh_, high_thresh_ + 0.18f);
 }
 
 std::vector<STrack> ByteTracker::update(const std::vector<HeadBox>& detections,

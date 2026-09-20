@@ -16,16 +16,6 @@ struct HeadBox {
     float score;
 };
 
-namespace hdv {
-    void update_frame_context(const unsigned char* rgba, int width, int height);
-    float candidate_prob_floor(int feature_idx, float mean_frame_lum);
-    void set_gain(float gain);
-    float get_gain();
-    bool verify_head_candidate(const unsigned char* rgba, int img_w, int img_h,
-                               float xmin, float ymin, float xmax, float ymax,
-                               int feature_idx);
-}
-
 class HeadDetector {
 public:
     HeadDetector();
