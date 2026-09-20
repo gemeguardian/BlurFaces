@@ -34,6 +34,8 @@ private:
     bool initialized_ = false;
     static constexpr int kInputW = 320;
     static constexpr int kInputH = 320;
+    std::vector<float> y_buf_;
+    std::vector<float> y_bal_buf_;
 };
 
 #endif // HEAD_DETECTOR_H
