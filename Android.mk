@@ -16,6 +16,6 @@ LOCAL_STATIC_LIBRARIES := ncnn
 # ncnn was built with OpenMP; keep its runtime statically contained in the
 # hot-loaded library and limit execution to one worker in HeadDetector::load().
 LOCAL_LDLIBS := -landroid -llog -lz -ljnigraphics -fopenmp -static-openmp
-LOCAL_CPPFLAGS := -std=c++17 -fvisibility=hidden -fopenmp
-LOCAL_LDFLAGS := -Wl,-Bsymbolic -Wl,--exclude-libs,ALL
+LOCAL_CPPFLAGS := -std=c++17 -fvisibility=hidden -fopenmp -ffunction-sections -fdata-sections -Os
+LOCAL_LDFLAGS := -Wl,-Bsymbolic -Wl,--exclude-libs,ALL -Wl,--gc-sections
 include $(BUILD_SHARED_LIBRARY)

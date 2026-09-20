@@ -5,6 +5,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.request
 
 from dalvik.system import DexClassLoader
 from elyx import assets
@@ -13,7 +14,7 @@ from java.lang import Float, Integer, String
 from java.util.function import Consumer
 from org.telegram.messenger import ApplicationLoader
 
-from .asset_hashes import ASSET_HASHES
+from .asset_hashes import ASSET_HASHES, MODEL_BIN_URL, MODEL_BIN_SHA256, MODEL_BIN_SIZE
 
 
 CLASS_NAME = "com.makey.blurfaces.g2.Main"
@@ -29,9 +30,8 @@ RUNTIME_BUNDLE_ID = hashlib.sha256((LOADER_ABI_SALT + "\0" + "".join(
         "dex/core.dex",
         "jni/arm64-v8a/libblur_faces.so",
         "model/head_det.param",
-        "model/head_det.bin",
     )
-)).encode("ascii")).hexdigest()
+) + MODEL_BIN_SHA256).encode("ascii")).hexdigest()
 _REGISTRY_KEY = "_blur_faces_ncnn_runtime_v3"
 _EPOCH_KEY = "_blur_faces_runtime_module_epoch"
 _MODULE_EPOCH = getattr(sys, _EPOCH_KEY, 0) + 1
@@ -172,7 +172,72 @@ def _release_loaded_core(registry):
     registry["methods"].clear()
 
 
-def _ensure_runtime_loaders(context, registry):
+def _download_model_bin(target, logger=None):
+    expected = MODEL_BIN_SHA256
+    expected_size = MODEL_BIN_SIZE
+    url = MODEL_BIN_URL
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    if os.path.isfile(target) and _sha256(target) == expected:
+        try:
+            os.chmod(target, 0o444)
+        except OSError:
+            pass
+        return target
+
+    if logger:
+        logger(f"[BlurFaces] Downloading YOLOv8n head detector weights ({expected_size // 1024 // 1024} MB)...")
+
+    fd, temporary = tempfile.mkstemp(prefix="head_det.bin.", dir=os.path.dirname(target))
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 (Android; Mobile; BlurFaces/3.0.0)"}
+        )
+        digest = hashlib.sha256()
+        downloaded = 0
+        last_log = time.time()
+        with os.fdopen(fd, "wb") as output, urllib.request.urlopen(req, timeout=45) as resp:
+            fd = None
+            while True:
+                chunk = resp.read(64 * 1024)
+                if not chunk:
+                    break
+                output.write(chunk)
+                digest.update(chunk)
+                downloaded += len(chunk)
+                now = time.time()
+                if logger and now - last_log >= 2.0:
+                    last_log = now
+                    pct = int(downloaded * 100 / expected_size) if expected_size > 0 else 0
+                    logger(f"[BlurFaces] Downloading model: {pct}% ({downloaded // 1024} KB)")
+            output.flush()
+            os.fsync(output.fileno())
+
+        if digest.hexdigest() != expected:
+            raise ValueError(f"Downloaded model SHA-256 mismatch: {digest.hexdigest()} vs {expected}")
+
+        os.replace(temporary, target)
+        try:
+            os.chmod(target, 0o444)
+        except OSError:
+            pass
+        if logger:
+            logger(f"[BlurFaces] Model weights verified and ready: {target}")
+        return target
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if os.path.exists(temporary):
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+
+
+def _ensure_runtime_loaders(context, registry, logger=None):
     loaded_epoch = registry.get("module_epoch", 0)
     if loaded_epoch > _MODULE_EPOCH:
         raise RuntimeError("Stale Blur Faces plugin instance")
@@ -194,9 +259,9 @@ def _ensure_runtime_loaders(context, registry):
         "model/head_det.param",
         os.path.join(model_dir, "head_det.param"), True,
     )
-    _stage_asset(
-        "model/head_det.bin",
-        os.path.join(model_dir, "head_det.bin"), True,
+    _download_model_bin(
+        os.path.join(model_dir, "head_det.bin"),
+        logger=logger,
     )
 
     opt = context.getDir("blur_faces_dex_opt_v3", 0).getCanonicalPath()
@@ -224,15 +289,17 @@ def _ensure_runtime_loaders(context, registry):
     bridge_class.getMethod("ensureLoaded", String).invoke(None, so_path)
 
 
-def cached_model_path(context):
+def cached_model_path(context, logger=None):
     root = context.getDir("blur_faces_runtime_v3", 0).getCanonicalPath()
     param_path = os.path.join(root, "models", "head_det.param")
-    if os.path.isfile(param_path) and _sha256(param_path) == ASSET_HASHES["model/head_det.param"]:
+    bin_path = os.path.join(root, "models", "head_det.bin")
+    if (os.path.isfile(param_path) and _sha256(param_path) == ASSET_HASHES["model/head_det.param"]
+            and os.path.isfile(bin_path) and _sha256(bin_path) == MODEL_BIN_SHA256):
         return param_path
     registry = _runtime_registry()
     with registry["lock"]:
-        _ensure_runtime_loaders(context, registry)
-    return param_path if os.path.isfile(param_path) else None
+        _ensure_runtime_loaders(context, registry, logger=logger)
+    return param_path if (os.path.isfile(param_path) and os.path.isfile(bin_path) and _sha256(bin_path) == MODEL_BIN_SHA256) else None
 
 
 def runtime_restart_reason():
@@ -263,7 +330,7 @@ class DexRuntime:
                 if registry["broken"]:
                     self.plugin.log("[BlurFaces] Native runtime requires an application restart")
                     return False
-                _ensure_runtime_loaders(context, registry)
+                _ensure_runtime_loaders(context, registry, logger=self.plugin.log if self.plugin else None)
                 self.runtime_dir = registry["runtime_dir"]
                 if registry["main_class"] is None:
                     registry["main_class"] = registry["core_loader"].loadClass(CLASS_NAME)
@@ -279,12 +346,12 @@ class DexRuntime:
                     None, str(self.face_mask_scale))
                 _method(registry, dex_class, "setMaskMode", String).invoke(None, str(self.mask_mode))
 
-            model_path = cached_model_path(context)
+            model_path = cached_model_path(context, logger=self.plugin.log if self.plugin else None)
             if model_path is None:
-                self.plugin.log("[BlurFaces] Offline model staging failed")
+                self.plugin.log("[BlurFaces] Model download or staging failed")
                 return False
             self.plugin.log(
-                f"[BlurFaces] Active offline NCNN Head Detector model: {model_path}"
+                f"[BlurFaces] Active NCNN Head Detector model: {model_path}"
             )
 
             with registry["lock"]:

@@ -12,7 +12,6 @@ MANDATORY = {
     "dex/core.dex": ROOT / "build/dex/core.dex",
     "jni/arm64-v8a/libblur_faces.so": ROOT / "libs/arm64-v8a/libblur_faces.so",
     "model/head_det.param": ROOT / "models/head_det.param",
-    "model/head_det.bin": ROOT / "models/head_det.bin",
 }
 
 
@@ -66,10 +65,10 @@ assert "http://" not in runtime_source
 assert 'context.getDir("blur_faces_runtime_v3", 0)' in runtime_source
 assert 'dex_class.getMethod("clearLogger").invoke(None)' in runtime_source
 assert 'getMethod("setLogger", consumer_type).invoke(None, None)' not in runtime_source
-assert "download_model" not in runtime_source
 assert "delete_model" not in runtime_source
 assert "is_model_downloaded" not in runtime_source
 assert "switch_model" not in runtime_source
+assert "_download_model_bin" in runtime_source
 assert "ModelSettingsBridge" in bridge_source
 assert "ModelRadioCell extends FrameLayout" in bridge_source
 assert "CustomSetting.Factory<ModelRadioCell>" in bridge_source
@@ -103,7 +102,7 @@ hash_namespace = {}
 exec((TREE / "asset_hashes.py").read_text(encoding="ascii"), hash_namespace)
 expected_hashes = hash_namespace["ASSET_HASHES"]
 assert set(expected_hashes) == set(MANDATORY)
-assert len(MANDATORY) == 4
+assert len(MANDATORY) == 3
 for name, generated in MANDATORY.items():
     bundled = TREE / "assets" / name
     assert bundled.read_bytes() == generated.read_bytes()
@@ -120,7 +119,7 @@ if artifacts:
         assert not any(".gradle" in name or name.startswith("build/") or name.startswith("src/") for name in entries)
         binary_entries = {
             name for name in entries
-            if name.endswith((".dex", ".so", ".param", ".bin"))
+            if name.endswith((".dex", ".so", ".param"))
         }
         assert binary_entries == {"BlurFaces/assets/" + name for name in MANDATORY}
         for name, generated in MANDATORY.items():
@@ -128,6 +127,6 @@ if artifacts:
             payload = archive.read(entry)
             assert payload == generated.read_bytes()
             assert digest(payload) == expected_hashes[name]
-    print(f"PASS: archive has offline native runtime and bundled NCNN head detector: {artifact}")
+    print(f"PASS: archive has native runtime and verified on-demand NCNN head detector: {artifact}")
 else:
     print("PASS: static checks passed; ready for ElyxBuilder packaging")
