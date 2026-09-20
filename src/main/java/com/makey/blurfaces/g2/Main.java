@@ -97,7 +97,7 @@ public final class Main {
     // the long window here would blur a later face-free recording for no reason.
     static final long FLIP_GRACE_NS = 1_500_000_000L;
     static final long CAMERA_SWITCH_SETTLE_NS = 2_500_000_000L;
-    static final int CAMERA_SWITCH_BARRIER_MIN_FRAMES = 6;
+    static final int CAMERA_SWITCH_BARRIER_MIN_FRAMES = 1;
     private static final AtomicLong LAST_CAMERA_SWITCH_NANOS = new AtomicLong();
     private static final AtomicInteger CAMERA_SWITCH_BARRIER_FRAMES = new AtomicInteger(100);
     private static final AtomicInteger ENCODER_SWITCH_BARRIER_FRAMES = new AtomicInteger(100);
@@ -1073,7 +1073,6 @@ public final class Main {
     private static void captureUpdatedSurface(Object thread, SurfaceTexture surface, int slot) {
         CameraState state = cameraState(thread);
         long now = System.nanoTime();
-        if (now - LAST_CAMERA_SWITCH_NANOS.get() < 250_000_000L) return;
         ByteBuffer frameBuffer = null;
         String source = null;
         try {
@@ -1282,7 +1281,7 @@ public final class Main {
     private static void submitLatestFrame() {
         CapturedFrame frame = LATEST_FRAME.getAndSet(null);
         if (frame == null) { DRAIN_SCHEDULED.set(false); return; }
-        if (frame.captureNanos < LAST_CAMERA_SWITCH_NANOS.get() + 250_000_000L) {
+        if (frame.captureNanos < LAST_CAMERA_SWITCH_NANOS.get()) {
             releaseFirstDetectionLatch(frame.sourceKey);
             FRAME_POOL.offer(frame.rgba);
             DRAIN_SCHEDULED.set(false);
@@ -1629,44 +1628,11 @@ public final class Main {
     }
 
     private static boolean previewTransitionActive(Object thread) {
-        if (System.nanoTime() - LAST_CAMERA_SWITCH_NANOS.get() < 300_000_000L) return true;
-        if (CAMERA_SWITCH_BARRIER_FRAMES.get() < CAMERA_SWITCH_BARRIER_MIN_FRAMES) return true;
-        try {
-            Object outer = field(thread.getClass(), "this$0").get(thread);
-            if (outer != null) {
-                try {
-                    Field f = field(outer.getClass(), "flipAnimationInProgress");
-                    if (f != null && f.getBoolean(outer)) return true;
-                } catch (Throwable ignored) { }
-                try {
-                    int[] oldTextures = (int[]) field(outer.getClass(), "oldCameraTexture").get(outer);
-                    if (oldTextures != null && oldTextures.length > 0 && oldTextures[0] != 0) return true;
-                } catch (Throwable ignored) { }
-            }
-        } catch (Throwable ignored) { }
-        try {
-            int[] oldTextures = (int[]) field(thread.getClass(), "oldCameraTexture").get(thread);
-            return oldTextures != null && oldTextures.length > 0 && oldTextures[0] != 0;
-        } catch (Throwable ignored) { return false; }
+        return CAMERA_SWITCH_BARRIER_FRAMES.get() < CAMERA_SWITCH_BARRIER_MIN_FRAMES;
     }
 
     private static boolean encoderTransitionActive(Object renderer) {
-        if (System.nanoTime() - LAST_CAMERA_SWITCH_NANOS.get() < 300_000_000L) return true;
-        if (ENCODER_SWITCH_BARRIER_FRAMES.get() < CAMERA_SWITCH_BARRIER_MIN_FRAMES) return true;
-        try {
-            Object outer = field(renderer.getClass(), "this$0").get(renderer);
-            if (outer != null) {
-                try {
-                    Field f = field(outer.getClass(), "flipAnimationInProgress");
-                    if (f != null && f.getBoolean(outer)) return true;
-                } catch (Throwable ignored) { }
-                try {
-                    int[] oldTextures = (int[]) field(outer.getClass(), "oldCameraTexture").get(outer);
-                    if (oldTextures != null && oldTextures.length > 0 && oldTextures[0] != 0) return true;
-                } catch (Throwable ignored) { }
-            }
-        } catch (Throwable ignored) { }
-        return false;
+        return ENCODER_SWITCH_BARRIER_FRAMES.get() < CAMERA_SWITCH_BARRIER_MIN_FRAMES;
     }
 
     private static void restoreEncoderFields(Object renderer, EncoderState state) {
