@@ -89,6 +89,8 @@ bool verify_head_chrominance(const unsigned char* rgba, int img_w, int img_h,
     float step_y = static_cast<float>(box_h) / (kGrid + 1);
 
     int skin_hits = 0;
+    int yellow_hits = 0;
+    int sum_cb = 0;
     int sum_cr = 0;
     int sum_r = 0;
     int sum_b = 0;
@@ -108,9 +110,16 @@ bool verify_head_chrominance(const unsigned char* rgba, int img_w, int img_h,
             int cb = 128 + ((-43 * r - 85 * g + 128 * b) >> 8);
             int cr = 128 + ((128 * r - 107 * g - 21 * b) >> 8);
 
+            sum_cb += cb;
             sum_cr += cr;
             sum_r += r;
             sum_b += b;
+
+            // Artificial saturated yellow / amber (ceramics, mugs, plastic, beer)
+            // Human skin across all ethnicities physically never has Cb < 75
+            if (cb < 75 && r > 90 && g > 70) {
+                yellow_hits++;
+            }
 
             // Biological skin test across all ethnicities (Fitzpatrick types I through VI)
             // Melanin & hemoglobin optical laws dictate R > B and Cr >= 129
@@ -120,16 +129,23 @@ bool verify_head_chrominance(const unsigned char* rgba, int img_w, int img_h,
         }
     }
 
+    // Reject objects with non-biological saturated yellow (> 7% of box)
+    if (yellow_hits >= 5) return false;
+
     float skin_ratio = static_cast<float>(skin_hits) / total_samples;
+    float cb_mean = static_cast<float>(sum_cb) / total_samples;
     float cr_mean = static_cast<float>(sum_cr) / total_samples;
     int rb_diff = (sum_r - sum_b) / total_samples;
 
+    // Human skin has average Cb >= 100 (in tungsten warm light >= 92); yellow ceramics have Cb ~ 73
+    if (cb_mean < 92.0f) return false;
+
     if (feature_idx == 0) {
-        if (skin_ratio < 0.15f || cr_mean < 129.0f || rb_diff < 1) return false;
+        if (skin_ratio < 0.18f || cr_mean < 129.0f || rb_diff < 1) return false;
     } else if (feature_idx == 1) {
-        if (skin_ratio < 0.10f || cr_mean < 128.5f || rb_diff < 0) return false;
+        if (skin_ratio < 0.25f || cr_mean < 129.0f || rb_diff < 1) return false;
     } else {
-        if (skin_ratio < 0.20f || cr_mean < 130.0f || rb_diff < 1) return false;
+        if (skin_ratio < 0.25f || cr_mean < 130.0f || rb_diff < 1) return false;
     }
 
     return true;
