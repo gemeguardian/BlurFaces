@@ -191,7 +191,7 @@ def _download_model_bin(target, logger=None):
     try:
         req = urllib.request.Request(
             url,
-            headers={"User-Agent": "Mozilla/5.0 (Android; Mobile; BlurFaces/3.0.0)"}
+            headers={"User-Agent": "Mozilla/5.0 (Android; Mobile; BlurFaces/1.0.0)"}
         )
         digest = hashlib.sha256()
         downloaded = 0

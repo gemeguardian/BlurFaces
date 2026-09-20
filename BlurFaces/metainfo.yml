@@ -1,6 +1,6 @@
 id: blur_faces
 name: Blur Faces
-version: "3.0.0"
+version: "1.0.0"
 author: "@gemeguardian"
 description: "{plugin_description}"
 app_version: ">=12.5.1"

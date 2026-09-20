@@ -605,7 +605,7 @@ public final class Main {
             acceptingFrames = true;
             initialized = true;
             setProtectionState("ACTIVE");
-            emit("Native NCNN HeadDetector + ByteTrack v3.0 armed on CPU NEON");
+            emit("Native NCNN HeadDetector + ByteTrack v1.0 armed on CPU NEON");
         } catch (Throwable error) {
             setProtectionState("FAILED");
             emit("Native head detector unavailable; host camera left untouched", error);

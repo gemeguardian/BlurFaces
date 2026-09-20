@@ -73,7 +73,7 @@ with hash_file.open("w", encoding="ascii") as output:
     for name, digest in hashes.items():
         output.write(f'    "{name}": "{digest}",\n')
     output.write("}\n\n")
-    output.write('MODEL_BIN_URL = "https://github.com/gemeguardian/BlurFaces/releases/download/v3.0.0/head_det.bin"\n')
+    output.write('MODEL_BIN_URL = "https://github.com/gemeguardian/BlurFaces/releases/download/v1.0.0/head_det.bin"\n')
     output.write(f'MODEL_BIN_SHA256 = "{bin_hash}"\n')
     output.write(f'MODEL_BIN_SIZE = {bin_size}\n')
 

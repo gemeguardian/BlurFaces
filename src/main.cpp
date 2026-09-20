@@ -27,12 +27,12 @@ static void allow_duplicate_openmp() {
 
 extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM*, void*) {
     allow_duplicate_openmp();
-    LOGI("native plugin v3.0 loaded (NCNN HeadDetector + ByteTrack)");
+    LOGI("native plugin v1.0 loaded (NCNN HeadDetector + ByteTrack)");
     return JNI_VERSION_1_6;
 }
 
 extern "C" JNIEXPORT void JNICALL JNI_OnUnload(JavaVM*, void*) {
-    LOGI("native plugin v3.0 unloaded");
+    LOGI("native plugin v1.0 unloaded");
     std::lock_guard<std::mutex> lock(g_engine_mutex);
     if (g_detector) { delete g_detector; g_detector = nullptr; }
     if (g_tracker) { delete g_tracker; g_tracker = nullptr; }

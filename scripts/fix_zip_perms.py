@@ -7,7 +7,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 
 def fix_zip_permissions():
-    zip_path = ROOT / "builds" / "blur_faces-3.0.0.elyx"
+    zip_path = ROOT / "builds" / "blur_faces-1.0.0.elyx"
     if not zip_path.exists():
         return
     temp_buf = io.BytesIO()

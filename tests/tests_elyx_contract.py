@@ -21,7 +21,7 @@ def digest(data):
 
 meta = (TREE / "metainfo.yml").read_text(encoding="utf-8")
 assert "id: blur_faces" in meta
-assert 'version: "3.0.0"' in meta
+assert 'version: "1.0.0"' in meta
 assert 'author: "@gemeguardian"' in meta
 assert 'requirements: ""' in meta
 refmap = (ROOT / "refmap.yml").read_text(encoding="utf-8")
@@ -109,7 +109,7 @@ for name, generated in MANDATORY.items():
     assert bundled.read_bytes() == generated.read_bytes()
     assert digest(bundled.read_bytes()) == expected_hashes[name]
 
-artifacts = sorted((ROOT / "builds").glob("blur_faces-3.0.0*.elyx"), key=lambda path: path.stat().st_mtime_ns)
+artifacts = sorted((ROOT / "builds").glob("blur_faces-1.0.0*.elyx"), key=lambda path: path.stat().st_mtime_ns)
 if artifacts:
     artifact = artifacts[-1]
     with zipfile.ZipFile(artifact) as archive:
