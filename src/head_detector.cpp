@@ -121,9 +121,9 @@ bool verify_head_chrominance(const unsigned char* rgba, int img_w, int img_h,
                 yellow_hits++;
             }
 
-            // Biological skin test across all ethnicities (Fitzpatrick types I through VI)
-            // Melanin & hemoglobin optical laws dictate R > B and Cr >= 129
-            if (cb >= 77 && cb <= 130 && cr >= 129 && cr <= 175 && r > b) {
+            // Standard biological skin locus (Fitzpatrick I through VI)
+            // Excludes near-neutral gray/black objects (chairs, clothes, cushions)
+            if (cb >= 77 && cb <= 127 && cr >= 133 && cr <= 173 && (r > b)) {
                 skin_hits++;
             }
         }
@@ -140,12 +140,19 @@ bool verify_head_chrominance(const unsigned char* rgba, int img_w, int img_h,
     // Human skin has average Cb >= 100 (in tungsten warm light >= 92); yellow ceramics have Cb ~ 73
     if (cb_mean < 92.0f) return false;
 
+    // Euclidean chrominance radius from neutral gray (128, 128)
+    // Chair = 2.29, knees = 0.8, dark clothes < 2.5, true human heads >= 3.05
+    float d_cr = cr_mean - 128.0f;
+    float d_cb = cb_mean - 128.0f;
+    float chroma_dist = std::sqrt(d_cr * d_cr + d_cb * d_cb);
+    if (chroma_dist < 2.85f) return false;
+
     if (feature_idx == 0) {
-        if (skin_ratio < 0.18f || cr_mean < 129.0f || rb_diff < 1) return false;
+        if (skin_ratio < 0.18f || cr_mean < 130.5f || rb_diff < 1) return false;
     } else if (feature_idx == 1) {
-        if (skin_ratio < 0.25f || cr_mean < 129.0f || rb_diff < 1) return false;
+        if (skin_ratio < 0.18f || cr_mean < 130.9f || rb_diff < 1) return false;
     } else {
-        if (skin_ratio < 0.25f || cr_mean < 130.0f || rb_diff < 1) return false;
+        if (skin_ratio < 0.22f || cr_mean < 131.0f || rb_diff < 1) return false;
     }
 
     return true;
