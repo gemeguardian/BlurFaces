@@ -45,7 +45,11 @@ void nms(std::vector<HeadBox>& candidates, std::vector<HeadBox>& picked, float t
 
 } // namespace
 
-HeadDetector::HeadDetector() : initialized_(false) {}
+HeadDetector::HeadDetector() : initialized_(false) {
+    lum_buf_.resize(kInputW * kInputH);
+    temp_buf_.resize(kInputW * kInputH);
+    base_buf_.resize(kInputW * kInputH);
+}
 
 HeadDetector::~HeadDetector() {
     clear();
@@ -111,9 +115,12 @@ int HeadDetector::detect(const unsigned char* rgba_pixels, int width, int height
     }
     float mean_lum = (sample_count > 0) ? (static_cast<float>(sum_lum) / sample_count) : 128.0f;
 
-    // If scene is in low light / darkness (< 65 luma), apply gentle adaptive gamma tone mapping
-    // to boost facial gradient signals for the CNN without amplifying raw sensor noise.
-    if (mean_lum < 65.0f && mean_lum > 8.0f) {
+    // If scene is in low light / darkness (< 65 luma), apply Dual-Domain Retinex Tone Mapping:
+    // 1. Decomposes image into Smooth Illumination Base (L) and High-Frequency Detail (D).
+    // 2. Cores out low-amplitude high-frequency sensor noise (eliminates fake textures on walls/furniture).
+    // 3. Sharpens structural gradients (head silhouette, ears, chin, hair boundary).
+    // 4. Boosts smooth illumination without noise amplification and suppresses chromatic noise.
+    if (mean_lum < 65.0f && mean_lum > 5.0f) {
         float t = std::clamp((65.0f - mean_lum) / 50.0f, 0.0f, 1.0f);
         float gamma = 1.0f - t * 0.28f;
         float lut[256];
@@ -126,12 +133,95 @@ int HeadDetector::detect(const unsigned char* rgba_pixels, int width, int height
             }
         }
 
-        for (int c = 0; c < 3; ++c) {
-            float* ptr = input.channel(c);
-            for (int i = 0; i < kInputW * kInputH; ++i) {
-                int v = std::clamp(static_cast<int>(ptr[i] + 0.5f), 0, 255);
-                ptr[i] = lut[v];
+        float* r_ptr = input.channel(0);
+        float* g_ptr = input.channel(1);
+        float* b_ptr = input.channel(2);
+        constexpr int N = kInputW * kInputH;
+
+        if (lum_buf_.size() < N) lum_buf_.resize(N);
+        if (temp_buf_.size() < N) temp_buf_.resize(N);
+        if (base_buf_.size() < N) base_buf_.resize(N);
+
+        float* lum = lum_buf_.data();
+        float* temp = temp_buf_.data();
+        float* base = base_buf_.data();
+
+        // 1. Compute input luminance Y
+        for (int i = 0; i < N; ++i) {
+            lum[i] = 0.299f * r_ptr[i] + 0.587f * g_ptr[i] + 0.114f * b_ptr[i];
+        }
+
+        // 2. Fast separable box blur (radius = 3, window = 7) on luminance to extract smooth base illumination
+        constexpr int rad = 3;
+        constexpr float inv_win = 1.0f / (2.0f * rad + 1.0f);
+
+        // Horizontal pass
+        for (int y = 0; y < kInputH; ++y) {
+            const float* src_row = lum + y * kInputW;
+            float* dst_row = temp + y * kInputW;
+            float sum = 0.0f;
+            for (int x = -rad; x <= rad; ++x) {
+                int cx = std::clamp(x, 0, kInputW - 1);
+                sum += src_row[cx];
             }
+            dst_row[0] = sum * inv_win;
+            for (int x = 1; x < kInputW; ++x) {
+                int add_x = std::min(kInputW - 1, x + rad);
+                int sub_x = std::max(0, x - rad - 1);
+                sum += src_row[add_x] - src_row[sub_x];
+                dst_row[x] = sum * inv_win;
+            }
+        }
+
+        // Vertical pass
+        for (int x = 0; x < kInputW; ++x) {
+            float sum = 0.0f;
+            for (int y = -rad; y <= rad; ++y) {
+                int cy = std::clamp(y, 0, kInputH - 1);
+                sum += temp[cy * kInputW + x];
+            }
+            base[0 * kInputW + x] = sum * inv_win;
+            for (int y = 1; y < kInputH; ++y) {
+                int add_y = std::min(kInputH - 1, y + rad);
+                int sub_y = std::max(0, y - rad - 1);
+                sum += temp[add_y * kInputW + x] - temp[sub_y * kInputW + x];
+                base[y * kInputW + x] = sum * inv_win;
+            }
+        }
+
+        // 3. Noise coring threshold: small fluctuations in dark regions are sensor noise
+        float tau_noise = 2.5f + t * 6.5f;
+        float desat = t * 0.45f;
+
+        // 4. Edge-preserving synthesis and chroma desaturation
+        for (int i = 0; i < N; ++i) {
+            float y_val = lum[i];
+            float l_val = base[i];
+            float detail = y_val - l_val;
+
+            // Dead-zone noise coring on high-frequency detail:
+            // Noise (abs(detail) < tau_noise) is suppressed to ZERO.
+            // Strong anatomical boundaries (abs(detail) >= tau_noise) are preserved and boosted.
+            float clean_detail = 0.0f;
+            float abs_det = std::abs(detail);
+            if (abs_det > tau_noise) {
+                float sign = (detail > 0.0f) ? 1.0f : -1.0f;
+                clean_detail = sign * (abs_det - tau_noise) * 1.25f;
+            }
+
+            int l_idx = std::clamp(static_cast<int>(l_val + 0.5f), 0, 255);
+            float boosted_l = lut[l_idx];
+            float clean_y = std::clamp(boosted_l + clean_detail, 0.0f, 255.0f);
+
+            float gain = clean_y / std::max(y_val, 1.0f);
+            float r_new = r_ptr[i] * gain;
+            float g_new = g_ptr[i] * gain;
+            float b_new = b_ptr[i] * gain;
+
+            // Blend out chromatic sensor noise towards clean luminance in darkness
+            r_ptr[i] = std::clamp(r_new * (1.0f - desat) + clean_y * desat, 0.0f, 255.0f);
+            g_ptr[i] = std::clamp(g_new * (1.0f - desat) + clean_y * desat, 0.0f, 255.0f);
+            b_ptr[i] = std::clamp(b_new * (1.0f - desat) + clean_y * desat, 0.0f, 255.0f);
         }
     }
 
@@ -173,6 +263,18 @@ int HeadDetector::detect(const unsigned char* rgba_pixels, int width, int height
         float bbox_cy = ptr_cy[i] * inv_h;
         float bbox_w  = ptr_w[i]  * inv_w;
         float bbox_h  = ptr_h[i]  * inv_h;
+
+        // Circular Telegram video attention prior:
+        // Candidates located in extreme corners outside the Telegram round circle (r > 0.52)
+        // are never visible in the round video message; apply progressive confidence penalty.
+        float dx = bbox_cx - 0.5f;
+        float dy = bbox_cy - 0.5f;
+        float dist_sq = dx * dx + dy * dy;
+        if (dist_sq > 0.27f) {
+            float dist = std::sqrt(dist_sq);
+            float corner_penalty = (dist - 0.52f) * 1.5f;
+            if (prob < prob_threshold + corner_penalty) continue;
+        }
 
         float xmin = std::max(0.0f, std::min(1.0f, bbox_cx - bbox_w * 0.5f));
         float ymin = std::max(0.0f, std::min(1.0f, bbox_cy - bbox_h * 0.5f));
