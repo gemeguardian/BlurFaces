@@ -105,7 +105,7 @@ Steps executed:
 Run the test suite:
 
 ```bash
-python3 -m pytest tests_*.py
-python3 tests_tracking_behavior.py
-python3 tests_elyx_contract.py
+python3 -m pytest tests/tests_*.py
+python3 tests/tests_tracking_behavior.py
+python3 tests/tests_elyx_contract.py
 ```

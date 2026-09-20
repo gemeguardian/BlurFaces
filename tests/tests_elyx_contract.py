@@ -6,7 +6,7 @@ import zipfile
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent.parent
 TREE = ROOT / "BlurFaces"
 MANDATORY = {
     "dex/core.dex": ROOT / "build/dex/core.dex",

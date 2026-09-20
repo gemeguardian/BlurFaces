@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent.parent
 MAIN_PATH = ROOT / "BlurFaces/main.py"
 RUNTIME_PATH = ROOT / "BlurFaces/runtime.py"
 REFLECTION_PATHS = (

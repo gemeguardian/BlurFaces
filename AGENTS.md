@@ -42,7 +42,7 @@ This document provides instructions for agents and developers working on the `bl
 ├── build.sh                      # Unified build script (NDK + Gradle + elyb)
 ├── build.py                      # Asset validation, staging & hash generator
 ├── HANDOFF.md                    # Architecture handoff documentation
-├── DEVICE_VALIDATION_3.0.0.md    # Physical device testing checklist
+├── README.md                     # Project overview and quickstart
 ├── src/                          # Native C++ & Java source code
 │   ├── head_detector.cpp/.h      # NCNN inference & multi-cue filters
 │   ├── bytetrack.cpp/.h          # Multi-object ByteTrack tracker
@@ -59,7 +59,7 @@ This document provides instructions for agents and developers working on the `bl
 │   ├── strings/                  # Localization (ru, en)
 │   └── assets/                   # Bundled binaries & NCNN models
 ├── legacy/                       # Retired components (SCRFD, old landmarker tests)
-└── tests_*.py                    # Unit and regression test contracts
+└── tests/                        # Unit and regression test contracts
 ```
 
 ## Build Environment
@@ -82,9 +82,9 @@ The output installable artifact is generated at:
 Before completing any changes:
 ```bash
 # 1. Run Python test contracts
-python3 -m pytest tests_*.py
-python3 tests_tracking_behavior.py
-python3 tests_elyx_contract.py
+python3 -m pytest tests/tests_*.py
+python3 tests/tests_tracking_behavior.py
+python3 tests/tests_elyx_contract.py
 
 # 2. Build the plugin and verify hashes
 ./build.sh

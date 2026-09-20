@@ -2,7 +2,7 @@
 import pathlib
 import unittest
 
-ROOT = pathlib.Path(__file__).resolve().parent
+ROOT = pathlib.Path(__file__).resolve().parent.parent
 HEAD_CPP = (ROOT / "src/head_detector.cpp").read_text(encoding="utf-8")
 BYTE_CPP = (ROOT / "src/bytetrack.cpp").read_text(encoding="utf-8")
 MAIN_CPP = (ROOT / "src/main.cpp").read_text(encoding="utf-8")

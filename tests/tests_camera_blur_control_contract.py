@@ -2,7 +2,7 @@ import pathlib
 import unittest
 
 
-ROOT = pathlib.Path(__file__).resolve().parent
+ROOT = pathlib.Path(__file__).resolve().parent.parent
 MAIN = (ROOT / "src/main/java/com/makey/blurfaces/g2/Main.java").read_text(encoding="utf-8")
 
 

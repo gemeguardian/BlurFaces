@@ -2,7 +2,7 @@
 import pathlib
 import unittest
 
-ROOT = pathlib.Path(__file__).resolve().parent
+ROOT = pathlib.Path(__file__).resolve().parent.parent
 SOURCE = (ROOT / "BlurFaces/main.py").read_text(encoding="utf-8")
 
 

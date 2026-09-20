@@ -2,7 +2,7 @@ import pathlib
 import unittest
 
 
-ROOT = pathlib.Path(__file__).resolve().parent
+ROOT = pathlib.Path(__file__).resolve().parent.parent
 PLUGIN = (ROOT / "BlurFaces/main.py").read_text()
 RUNTIME = (ROOT / "BlurFaces/runtime.py").read_text()
 JAVA = (ROOT / "src/main/java/com/makey/blurfaces/g2/Main.java").read_text()
