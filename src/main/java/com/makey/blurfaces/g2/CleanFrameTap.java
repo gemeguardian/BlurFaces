@@ -316,6 +316,11 @@ final class CleanFrameTap {
         while (GLES20.glGetError() != GLES20.GL_NO_ERROR) { }
     }
 
+    void resetPbo() {
+        pboPrimed = false;
+        pboIndex = 0;
+    }
+
     void release() {
         try { if (vbo != 0) GLES20.glDeleteBuffers(1, new int[]{vbo}, 0); } catch (Throwable ignored) { }
         try {

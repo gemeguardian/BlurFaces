@@ -806,6 +806,9 @@ public final class Main {
                     state.faceCount = -1;
                     state.blurTexture = 0;
                     java.util.Arrays.fill(state.faces, 0f);
+                    state.currFlowGray = null;
+                    state.prevFlowGray = null;
+                    if (state.tap != null) state.tap.resetPbo();
                 }
             }
         }
@@ -815,6 +818,7 @@ public final class Main {
                     state.faceCount = -1;
                     state.blurTexture = 0;
                     java.util.Arrays.fill(state.faces, 0f);
+                    if (state.tap != null) state.tap.resetPbo();
                 }
             }
         }
@@ -1855,6 +1859,10 @@ public final class Main {
         }
         state.faceCount = -1;
         state.blurTexture = 0;
+        java.util.Arrays.fill(state.faces, 0f);
+        state.currFlowGray = null;
+        state.prevFlowGray = null;
+        if (state.tap != null) state.tap.resetPbo();
         if (!hasFreshResult(source, now)) {
             FIRST_DETECTION_LATCH.putIfAbsent(source, new CountDownLatch(1));
         }
