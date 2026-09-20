@@ -329,11 +329,12 @@ def runtime_restart_reason():
 
 class DexRuntime:
     def __init__(self, plugin, round_video_width=0, face_mask_scale=100,
-                 detection_confidence=45):
+                 detection_confidence=45, blur_by_default=True):
         self.plugin = plugin
         self.round_video_width = round_video_width
         self.face_mask_scale = face_mask_scale
         self.detection_confidence = detection_confidence
+        self.blur_by_default = blur_by_default
         self.mask_mode = 0
         self.dex_main_class = None
         self.core_loader = None
@@ -366,6 +367,8 @@ class DexRuntime:
                 _method(registry, dex_class, "setFaceMaskScale", String).invoke(
                     None, str(self.face_mask_scale))
                 _method(registry, dex_class, "setMaskMode", String).invoke(None, str(self.mask_mode))
+                _method(registry, dex_class, "setBlurEnabled", String).invoke(
+                    None, "true" if self.blur_by_default else "false")
 
             model_path = cached_model_path(context, logger=self.plugin.log if self.plugin else None)
             if model_path is None:
@@ -438,6 +441,19 @@ class DexRuntime:
             plugin = self.plugin
             if plugin is not None:
                 plugin.log(f"[BlurFaces] Mask mode update failed: {error}")
+
+    def set_blur_by_default(self, enabled):
+        self.blur_by_default = enabled
+        dex_class = self.dex_main_class
+        if dex_class is None:
+            return
+        try:
+            registry = _runtime_registry()
+            _method(registry, dex_class, "setBlurEnabled", String).invoke(None, "true" if enabled else "false")
+        except Exception as error:
+            plugin = self.plugin
+            if plugin is not None:
+                plugin.log(f"[BlurFaces] Blur state update failed: {error}")
 
     def run_privacy_self_test(self, mask_scale=None, mask_mode=None):
         if mask_scale is None:

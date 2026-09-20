@@ -830,6 +830,10 @@ public final class Main {
                 : "Face blur disabled from camera controls");
     }
 
+    public static void setBlurEnabled(String enabledValue) {
+        setBlurEnabled(enabledValue == null || (!"false".equalsIgnoreCase(enabledValue) && !"0".equals(enabledValue)));
+    }
+
     private static void refreshBlurControls() {
         AndroidUtilities.runOnUIThread(() -> {
             synchronized (BLUR_CONTROLS) {

@@ -18,6 +18,7 @@ class BlurFacesPlugin(BasePlugin):
     def __init__(self):
         super().__init__()
         self.enabled = True
+        self.blur_by_default = True
         self.round_video_width_index = 0
         self.detection_range_index = 0
         self.mask_mode_index = 0
@@ -29,7 +30,8 @@ class BlurFacesPlugin(BasePlugin):
     def on_plugin_load(self):
         self.log("[BlurFaces] Plugin loading...")
         self._loaded = True
-        self.enabled = bool(self.get_setting("enabled", True))
+        self.enabled = True
+        self.blur_by_default = bool(self.get_setting("blur_by_default", True))
         self.round_video_width_index = 0
         self.detection_range_index = self._valid_range_index(
             self.get_setting("detection_range", 0)
@@ -51,6 +53,7 @@ class BlurFacesPlugin(BasePlugin):
                 round_video_width=ROUND_VIDEO_WIDTHS[self.round_video_width_index],
                 face_mask_scale=FACE_MASK_SCALE,
                 detection_confidence=DETECTION_CONFIDENCES[self.detection_range_index],
+                blur_by_default=self.blur_by_default,
             )
             if not runtime.stage_and_start():
                 return
@@ -86,12 +89,12 @@ class BlurFacesPlugin(BasePlugin):
         return [
             Header(strings.get("settings_header")),
             Switch(
-                key="enabled",
-                text=strings.get("settings_enabled"),
-                default=self.enabled,
-                on_change=self._on_enabled_change,
+                key="blur_by_default",
+                text=strings.get("settings_blur_by_default"),
+                default=self.blur_by_default,
+                on_change=self._on_blur_by_default_change,
             ),
-            Divider(text=strings.get("settings_enabled_subtext")),
+            Divider(text=strings.get("settings_blur_by_default_subtext")),
             Selector(
                 key="mask_mode",
                 text=strings.get("settings_mask_mode"),
@@ -144,16 +147,13 @@ class BlurFacesPlugin(BasePlugin):
             return 0
         return index if index in MASK_MODES else 0
 
-    def _on_enabled_change(self, value):
-        self.enabled = bool(value)
-        self.set_setting("enabled", self.enabled)
-        self._generation += 1
-        generation = self._generation
-        if self.enabled:
-            run_on_queue(lambda: self._prepare_runtime(generation))
-        else:
-            run_on_queue(self._stop_runtime)
-        self.log(f"[BlurFaces] Enabled: {self.enabled}")
+    def _on_blur_by_default_change(self, value):
+        self.blur_by_default = bool(value)
+        self.set_setting("blur_by_default", self.blur_by_default)
+        runtime = self.dex_loader
+        if runtime:
+            run_on_queue(lambda: runtime.set_blur_by_default(self.blur_by_default))
+        self.log(f"[BlurFaces] Blur by default: {self.blur_by_default}")
 
     def _on_width_change(self, value):
         index = self._valid_width_index(value)
