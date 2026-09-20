@@ -89,11 +89,14 @@ bool verify_head_chrominance(const unsigned char* rgba, int img_w, int img_h,
     float step_y = static_cast<float>(box_h) / (kGrid + 1);
 
     int skin_hits = 0;
+    int center_skin_hits = 0;
     int yellow_hits = 0;
     int sum_cb = 0;
     int sum_cr = 0;
     int sum_r = 0;
     int sum_b = 0;
+    int min_lum = 255;
+    int max_lum = 0;
     constexpr int total_samples = kGrid * kGrid;
 
     for (int j = 1; j <= kGrid; ++j) {
@@ -105,6 +108,10 @@ bool verify_head_chrominance(const unsigned char* rgba, int img_w, int img_h,
             int r = p[0];
             int g = p[1];
             int b = p[2];
+
+            int lum = (r * 77 + g * 150 + b * 29) >> 8;
+            if (lum < min_lum) min_lum = lum;
+            if (lum > max_lum) max_lum = lum;
 
             // Integer fixed-point ITU-R BT.601 YCbCr conversion
             int cb = 128 + ((-43 * r - 85 * g + 128 * b) >> 8);
@@ -125,6 +132,9 @@ bool verify_head_chrominance(const unsigned char* rgba, int img_w, int img_h,
             // Excludes near-neutral gray/black objects (chairs, clothes, cushions)
             if (cb >= 77 && cb <= 127 && cr >= 133 && cr <= 173 && (r > b)) {
                 skin_hits++;
+                if (j >= 3 && j <= 6 && i >= 3 && i <= 6) {
+                    center_skin_hits++;
+                }
             }
         }
     }
@@ -147,10 +157,21 @@ bool verify_head_chrominance(const unsigned char* rgba, int img_w, int img_h,
     float chroma_dist = std::sqrt(d_cr * d_cr + d_cb * d_cb);
     if (chroma_dist < 2.85f) return false;
 
-    // Real human heads have hair, clothing/collar, eyes and background (skin rarely exceeds 75%).
-    // Monolithic sheets of brown kraft cardboard / wood veneer have 85% - 97% uniform "skin" color.
+    // Real human heads have skin across the central facial core (nose, cheeks, mouth).
+    // Inanimate clothes hangers / coat silhouettes only have peripheral skin locus hits from walls or hanger edges.
     float box_area = (xmax - xmin) * (ymax - ymin);
-    if (skin_ratio > 0.82f && box_area > 0.08f) return false;
+    if (feature_idx == 0 || box_area > 0.15f) {
+        if (center_skin_hits < 3) return false;
+    } else {
+        if (center_skin_hits < 1) return false;
+    }
+
+    // Real close-up faces (where hair/collar is out of frame) have high skin ratio (82% - 98%).
+    // Unlike flat cardboard sheets or wood veneer, real faces contain high-contrast facial
+    // micro-structures (eyes, pupils, nostrils, mouth fissure) with luminance variation.
+    if (skin_ratio > 0.82f && box_area > 0.08f) {
+        if ((max_lum - min_lum) < 22) return false;
+    }
 
     if (feature_idx == 0) {
         if (skin_ratio < 0.18f || cr_mean < 130.5f || rb_diff < 1) return false;
@@ -338,9 +359,9 @@ int HeadDetector::detect(const unsigned char* rgba_pixels, int width, int height
 
                         // Physical bounding box sanity checks for human head in round video notes:
                         // - Min: 8% width, 10% height (rejects buttons, specks, tags)
-                        // - Max: 85% width, 85% height (supports close-up selfies without room-filling explosions)
+                        // - Max: 100% width, 100% height (supports full-frame close-up selfies)
                         // - Aspect ratio width/height: range [0.45, 1.60] (supports head tilts and profiles)
-                        if (bw >= 0.08f && bh >= 0.10f && bw <= 0.85f && bh <= 0.85f) {
+                        if (bw >= 0.08f && bh >= 0.10f && bw <= 1.0f && bh <= 1.0f) {
                             if (bw < 0.11f || bh < 0.13f) {
                                 if (prob < 0.38f) {
                                     xptr++; yptr++; wptr++; hptr++; score_ptr++;
