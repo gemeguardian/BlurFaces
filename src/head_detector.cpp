@@ -11,21 +11,6 @@
 
 namespace {
 
-const float kHeadAnchors[6 * 2] = {
-    192.0f, 240.0f, 384.0f, 480.0f, // feature 0: stride 32
-    48.0f,  60.0f,  96.0f,  120.0f, // feature 1: stride 16
-    12.0f,  15.0f,  24.0f,  30.0f   // feature 2: stride 8
-};
-
-inline float sigmoid(float x) {
-    return 1.0f / (1.0f + std::exp(-x));
-}
-
-inline float inverse_sigmoid(float x) {
-    float clamped = std::max(1e-5f, std::min(1.0f - 1e-5f, x));
-    return -std::log(1.0f / clamped - 1.0f);
-}
-
 float compute_iou(const HeadBox& a, const HeadBox& b) {
     float x1 = std::max(a.x1, b.x1);
     float y1 = std::max(a.y1, b.y1);
@@ -63,18 +48,23 @@ inline float compute_texture_energy(const ncnn::Mat& img, const HeadBox& box) {
         const float* row_below = g_ptr + (y + 1) * stride;
         for (int i = 1; i <= kSamples; ++i) {
             int x = x0 + static_cast<int>(i * step_x);
-            float gx = std::abs(row[x + 1] - row[x - 1]);
-            float gy = std::abs(row_below[x] - row_above[x]);
+            // Multiplied by 255 because img channel is normalized [0, 1]
+            float gx = std::abs(row[x + 1] - row[x - 1]) * 255.0f;
+            float gy = std::abs(row_below[x] - row_above[x]) * 255.0f;
             sum_grad += (gx + gy);
         }
     }
     return sum_grad / (kSamples * kSamples);
 }
 
-// Fast fixed-point chrominance validation to reject achromatic macro-hallucinations (knees, pants, floors)
-bool verify_head_chrominance(const unsigned char* rgba, int img_w, int img_h,
-                             float xmin, float ymin, float xmax, float ymax,
-                             int feature_idx) {
+// Lightweight candidate validation:
+// High-confidence proposals (prob >= 0.55f) from YOLOv8n (trained on HollywoodHeads and DAD-3DHeads)
+// are verified anatomically by the 3M-parameter network across all 360° yaw/pitch angles.
+// For borderline proposals (prob < 0.55f), we enforce biological hemoglobin chrominance and
+// canine snout contrast checks to reject furniture, floor patterns, and pets.
+bool verify_head_candidate(const unsigned char* rgba, int img_w, int img_h,
+                           float xmin, float ymin, float xmax, float ymax,
+                           float prob) {
     int ix0 = std::clamp(static_cast<int>(xmin * img_w), 0, img_w - 1);
     int iy0 = std::clamp(static_cast<int>(ymin * img_h), 0, img_h - 1);
     int ix1 = std::clamp(static_cast<int>(xmax * img_w), 0, img_w - 1);
@@ -88,10 +78,6 @@ bool verify_head_chrominance(const unsigned char* rgba, int img_w, int img_h,
     float step_x = static_cast<float>(box_w) / (kGrid + 1);
     float step_y = static_cast<float>(box_h) / (kGrid + 1);
 
-    int skin_hits = 0;
-    int center_skin_hits = 0;
-    int top_skin_hits = 0;
-    int yellow_hits = 0;
     int sum_cb = 0;
     int sum_cr = 0;
     int sum_r = 0;
@@ -99,8 +85,6 @@ bool verify_head_chrominance(const unsigned char* rgba, int img_w, int img_h,
     int sum_b = 0;
     int sum_lum = 0;
     int center_sum_lum = 0;
-    int min_lum = 255;
-    int max_lum = 0;
     constexpr int total_samples = kGrid * kGrid;
 
     for (int j = 1; j <= kGrid; ++j) {
@@ -114,8 +98,6 @@ bool verify_head_chrominance(const unsigned char* rgba, int img_w, int img_h,
             int b = p[2];
 
             int lum = (r * 77 + g * 150 + b * 29) >> 8;
-            if (lum < min_lum) min_lum = lum;
-            if (lum > max_lum) max_lum = lum;
             sum_lum += lum;
 
             if (j >= 3 && j <= 6 && i >= 3 && i <= 6) {
@@ -131,96 +113,39 @@ bool verify_head_chrominance(const unsigned char* rgba, int img_w, int img_h,
             sum_r += r;
             sum_g += g;
             sum_b += b;
-
-            // Artificial saturated yellow / amber (ceramics, mugs, plastic, beer)
-            // Human skin across all ethnicities physically never has Cb < 75
-            if (cb < 75 && r > 90 && g > 70) {
-                yellow_hits++;
-            }
-
-            // Standard biological skin locus (Fitzpatrick I through VI)
-            // Excludes near-neutral gray/black objects (chairs, clothes, cushions)
-            if (cb >= 77 && cb <= 127 && cr >= 133 && cr <= 173 && (r > b)) {
-                skin_hits++;
-                if (j <= 3) {
-                    top_skin_hits++;
-                }
-                if (j >= 3 && j <= 6 && i >= 3 && i <= 6) {
-                    center_skin_hits++;
-                }
-            }
         }
     }
-
-    // Reject objects with non-biological saturated yellow (> 7% of box)
-    if (yellow_hits >= 5) return false;
-
-    float skin_ratio = static_cast<float>(skin_hits) / total_samples;
-    float cb_mean = static_cast<float>(sum_cb) / total_samples;
-    float cr_mean = static_cast<float>(sum_cr) / total_samples;
-    int rb_diff = (sum_r - sum_b) / total_samples;
-
-    // Human skin has average Cb >= 100 (in tungsten warm light >= 92); yellow ceramics have Cb ~ 73
-    if (cb_mean < 92.0f) return false;
-
-    // Euclidean chrominance radius from neutral gray (128, 128)
-    // Chair = 2.29, knees = 0.8, dark clothes < 2.5, true human heads >= 3.05
-    float d_cr = cr_mean - 128.0f;
-    float d_cb = cb_mean - 128.0f;
-    float chroma_dist = std::sqrt(d_cr * d_cr + d_cb * d_cb);
-    if (chroma_dist < 2.85f) return false;
-
-    // Real human heads have contiguous facial skin across the central core (cheeks, nose, mouth).
-    // In human selfie video notes, center_skin_hits is >= 8 out of 16 (dataset min 9, mean 15.75).
-    // Dog body/torso/rump false positives have dark steel/black saddle or fur boundaries in center (< 8 hits).
-    if (center_skin_hits < 8) return false;
-
-    // Top skin check: human head upper quadrant contains forehead skin (dataset min 2, mean 20.0).
-    // Dog nose tips and dark pet backs contain zero skin locus hits in the upper 3 rows (< 2 hits).
-    if (top_skin_hits < 2) return false;
 
     float box_lum_mean = static_cast<float>(sum_lum) / total_samples;
     float center_lum_mean = static_cast<float>(center_sum_lum) / 16.0f;
 
-    // Canine dark-snout vs illuminated human facial core check:
-    // A human facial core is prominently illuminated (center_lum_mean / box_lum_mean >= 0.66).
-    // When a pet dog looks up surrounded by bright beige floor tiles, the center is a dark snout (< 55% of box mean).
-    if (box_lum_mean > 45.0f && (center_lum_mean / box_lum_mean) < 0.55f) {
+    // Canine dark-snout check:
+    // When a pet looks toward the camera against lighter backgrounds, the center snout is
+    // significantly darker than the box average (< 52% of box mean).
+    if (box_lum_mean > 45.0f && (center_lum_mean / box_lum_mean) < 0.52f) {
         return false;
     }
 
-    // Biological hemoglobin chrominance balance:
-    // Human skin across all Fitzpatrick types physically has (R - G) / (R - B) >= 0.58 (dataset mean 0.74, min 0.63).
-    // In contrast, canine fur, wood, and neutral gray/brown objects have R close to G (rg_ratio < 0.58).
+    // High confidence YOLOv8 detections (>= 0.55f) retain full 360° coverage (hair, back of head, hood).
+    if (prob >= 0.55f) {
+        return true;
+    }
+
+    // Borderline proposals (< 0.55f) must satisfy biological hemoglobin and chroma distance:
+    int rb_diff = (sum_r - sum_b) / total_samples;
     int rg_diff = (sum_r - sum_g) / total_samples;
+
+    // Biological hemoglobin chrominance balance: (R - G) / (R - B) >= 0.58
     if (rb_diff <= 0 || (rg_diff * 100) < (rb_diff * 58)) {
         return false;
     }
 
-    float box_area = (xmax - xmin) * (ymax - ymin);
-
-    // Canine full-body / torso fur suppression:
-    // A gigantic box (area > 0.55) filled with apparent skin locus (ratio > 0.70)
-    // must exhibit rich biological red chrominance (Cr >= 141.0).
-    // Flat/tan canine fur spanning the whole frame has Cr ~ 136 - 139.
-    if (box_area > 0.55f && skin_ratio > 0.70f && cr_mean < 141.0f) {
-        return false;
-    }
-
-    // Real close-up faces (where hair/collar is out of frame) have high skin ratio (82% - 98%).
-    // Unlike flat cardboard sheets or wood veneer, real faces contain high-contrast facial
-    // micro-structures (eyes, pupils, nostrils, mouth fissure) with luminance variation.
-    if (skin_ratio > 0.82f && box_area > 0.08f) {
-        if ((max_lum - min_lum) < 22) return false;
-    }
-
-    if (feature_idx == 0) {
-        if (skin_ratio < 0.18f || cr_mean < 130.5f || rb_diff < 1) return false;
-    } else if (feature_idx == 1) {
-        if (skin_ratio < 0.18f || cr_mean < 130.9f || rb_diff < 1) return false;
-    } else {
-        if (skin_ratio < 0.22f || cr_mean < 131.0f || rb_diff < 1) return false;
-    }
+    float cb_mean = static_cast<float>(sum_cb) / total_samples;
+    float cr_mean = static_cast<float>(sum_cr) / total_samples;
+    float d_cr = cr_mean - 128.0f;
+    float d_cb = cb_mean - 128.0f;
+    float chroma_dist = std::sqrt(d_cr * d_cr + d_cb * d_cb);
+    if (chroma_dist < 2.5f) return false;
 
     return true;
 }
@@ -293,7 +218,7 @@ int HeadDetector::detect(const unsigned char* rgba_pixels, int width, int height
         return -1;
     }
 
-    // RGBA to RGB (MXNet Gluon head detector was trained on RGB) and bilinear resize to 320x320
+    // RGBA to RGB and bilinear resize to 320x320
     ncnn::Mat input = ncnn::Mat::from_pixels_resize(rgba_pixels, ncnn::Mat::PIXEL_RGBA2RGB,
                                                     width, height, kInputW, kInputH);
 
@@ -337,140 +262,92 @@ int HeadDetector::detect(const unsigned char* rgba_pixels, int width, int height
         }
     }
 
+    // YOLOv8 input normalization: 0..255 -> 0.0..1.0
+    const float mean_vals[3] = {0.0f, 0.0f, 0.0f};
+    const float norm_vals[3] = {1.0f / 255.0f, 1.0f / 255.0f, 1.0f / 255.0f};
+    input.substract_mean_normalize(mean_vals, norm_vals);
+
     ncnn::Extractor ex = net_.create_extractor();
     ex.set_light_mode(true);
-    if (ex.input("data", input) != 0) {
+    if (ex.input("in0", input) != 0) {
         LOGE("head detector input failed");
         return -2;
     }
 
+    ncnn::Mat out;
+    if (ex.extract("out0", out) != 0) {
+        LOGE("failed to extract out0");
+        return -3;
+    }
+
     std::vector<HeadBox> candidates;
     candidates.reserve(32);
-    float score_threshold_logit = inverse_sigmoid(prob_threshold);
 
-    // Feature 0 (stride 32, anchor 192x240) and Feature 1 (stride 16, anchors 48x60 and 96x120)
-    // span head sizes from 11% to 85% of the frame.
-    // Feature 2 (stride 8, anchors 12x15 and 24x30) targets tiny micro-scale objects (3.7% - 9.4%),
-    // which never correspond to human heads in 1:1 round video notes (smallest real face in dataset
-    // is 17%x19%). In practice, F2 exclusively hallucinates on inanimate circular room artifacts
-    // (exercise hoops, door knobs, circular frames). Skipping F2 eliminates 76% of all anchor decodings
-    // and suppresses micro false positives completely with zero recall loss.
-    for (int feature_idx = 0; feature_idx < 2; ++feature_idx) {
-        char out_name[64];
-        std::snprintf(out_name, sizeof(out_name), "head_output%d_out%d_fwd", feature_idx, feature_idx);
-        ncnn::Mat out;
-        if (ex.extract(out_name, out) != 0) {
-            LOGE("failed to extract %s", out_name);
+    const float* ptr_cx   = out.row(0);
+    const float* ptr_cy   = out.row(1);
+    const float* ptr_w    = out.row(2);
+    const float* ptr_h    = out.row(3);
+    const float* ptr_conf = out.row(4);
+
+    const float inv_w = 1.0f / static_cast<float>(kInputW);
+    const float inv_h = 1.0f / static_cast<float>(kInputH);
+
+    for (int i = 0; i < out.w; ++i) {
+        float prob = ptr_conf[i];
+        if (prob < prob_threshold) continue;
+
+        float bbox_cx = ptr_cx[i] * inv_w;
+        float bbox_cy = ptr_cy[i] * inv_h;
+        float bbox_w  = ptr_w[i]  * inv_w;
+        float bbox_h  = ptr_h[i]  * inv_h;
+
+        float xmin = std::max(0.0f, std::min(1.0f, bbox_cx - bbox_w * 0.5f));
+        float ymin = std::max(0.0f, std::min(1.0f, bbox_cy - bbox_h * 0.5f));
+        float xmax = std::max(0.0f, std::min(1.0f, bbox_cx + bbox_w * 0.5f));
+        float ymax = std::max(0.0f, std::min(1.0f, bbox_cy + bbox_h * 0.5f));
+
+        float bw = xmax - xmin;
+        float bh = ymax - ymin;
+
+        // Circular mask upper sensor boundary clip:
+        // Boxes touching extreme top border (ymin <= 0.01) with small height (bh <= 0.25)
+        // correspond to sensor clipping artifacts or fingers on phone edge.
+        if (ymin <= 0.01f && bh <= 0.25f) continue;
+
+        // Physical bounding box sanity checks for human head in round video notes:
+        // - Min: 7% width, 8% height (rejects buttons, specks, tags)
+        // - Max: 100% width, 100% height (supports full-frame close-up selfies)
+        if (bw < 0.07f || bh < 0.08f || bw > 1.0f || bh > 1.0f) continue;
+
+        // Small clutter discrimination
+        if ((bw < 0.11f || bh < 0.13f) && prob < 0.38f) continue;
+
+        float aspect = bw / bh;
+        // Aspect ratio [0.35, 2.0] supports extreme head tilts and profile turns
+        if (aspect < 0.35f || aspect > 2.0f) continue;
+
+        if (!verify_head_candidate(rgba_pixels, width, height, xmin, ymin, xmax, ymax, prob)) {
             continue;
         }
 
-        for (int anchor_idx = 0; anchor_idx < 2; ++anchor_idx) {
-            // Anchor (384, 480) in feature 0 is larger than the entire frame (320x320).
-            // In round video selfies it only produces gigantic false positive boxes on floors/monitors.
-            if (feature_idx == 0 && anchor_idx == 1) continue;
+        HeadBox box;
+        box.x1 = xmin;
+        box.y1 = ymin;
+        box.x2 = xmax;
+        box.y2 = ymax;
+        box.cx = (xmin + xmax) * 0.5f;
+        box.cy = (ymin + ymax) * 0.5f;
+        box.w = bw;
+        box.h = bh;
+        box.score = prob;
 
-            int p = anchor_idx * 5; // 4 bbox + 1 score
-            const float* xptr = out.channel(p + 0);
-            const float* yptr = out.channel(p + 1);
-            const float* wptr = out.channel(p + 2);
-            const float* hptr = out.channel(p + 3);
-            const float* score_ptr = out.channel(p + 4);
-
-            const float bias_w = kHeadAnchors[feature_idx * 4 + anchor_idx * 2 + 0];
-            const float bias_h = kHeadAnchors[feature_idx * 4 + anchor_idx * 2 + 1];
-
-            for (int h = 0; h < out.h; ++h) {
-                for (int w = 0; w < out.w; ++w) {
-                    float box_score = *score_ptr;
-                    if (box_score > score_threshold_logit) {
-                        float bbox_cx = (w + *xptr) / static_cast<float>(out.w);
-                        float bbox_cy = (h + *yptr) / static_cast<float>(out.h);
-                        float bbox_w = std::exp(*wptr) * bias_w / static_cast<float>(kInputW);
-                        float bbox_h = std::exp(*hptr) * bias_h / static_cast<float>(kInputH);
-
-                        float prob = sigmoid(box_score);
-
-                        // Medium-scale F1 A1 anchor (96x120): true human heads in this scale always exhibit
-                        // sharp confidence >= 0.66 (mean 0.98). Suppress ambiguous pet/fur proposals (< 0.50).
-                        if (feature_idx == 1 && anchor_idx == 1 && prob < 0.50f) {
-                            xptr++; yptr++; wptr++; hptr++; score_ptr++;
-                            continue;
-                        }
-
-                        float xmin = std::max(0.0f, std::min(1.0f, bbox_cx - bbox_w * 0.5f));
-                        float ymin = std::max(0.0f, std::min(1.0f, bbox_cy - bbox_h * 0.5f));
-                        float xmax = std::max(0.0f, std::min(1.0f, bbox_cx + bbox_w * 0.5f));
-                        float ymax = std::max(0.0f, std::min(1.0f, bbox_cy + bbox_h * 0.5f));
-
-                        float bw = xmax - xmin;
-                        float bh = ymax - ymin;
-
-                        // Circular mask upper sensor boundary clip:
-                        // Boxes touching the extreme top border (ymin <= 0.01) with small height (bh <= 0.25)
-                        // correspond to sensor clipping artifacts or fingers on phone edge, outside the circular note.
-                        if (ymin <= 0.01f && bh <= 0.25f) {
-                            xptr++; yptr++; wptr++; hptr++; score_ptr++;
-                            continue;
-                        }
-
-                        // Physical bounding box sanity checks for human head in round video notes:
-                        // - Min: 8% width, 10% height (rejects buttons, specks, tags)
-                        // - Max: 100% width, 100% height (supports full-frame close-up selfies)
-                        // - Aspect ratio width/height: range [0.45, 1.60] (supports head tilts and profiles)
-                        if (bw >= 0.08f && bh >= 0.10f && bw <= 1.0f && bh <= 1.0f) {
-                            if (bw < 0.11f || bh < 0.13f) {
-                                if (prob < 0.38f) {
-                                    xptr++; yptr++; wptr++; hptr++; score_ptr++;
-                                    continue;
-                                }
-                            }
-                            float aspect = bw / bh;
-                            // Large box aspect ratio sanity: wide horizontal rectangles (aspect > 1.25) when width > 0.75
-                            // correspond to quadruped animal bodies lying down, never upright or tilted human heads.
-                            if (bw > 0.75f && aspect > 1.25f) {
-                                xptr++; yptr++; wptr++; hptr++; score_ptr++;
-                                continue;
-                            }
-                            if (aspect >= 0.45f && aspect <= 1.60f) {
-                                if (!verify_head_chrominance(rgba_pixels, width, height, xmin, ymin, xmax, ymax, feature_idx)) {
-                                    xptr++; yptr++; wptr++; hptr++; score_ptr++;
-                                    continue;
-                                }
-                                HeadBox box;
-                                box.x1 = xmin;
-                                box.y1 = ymin;
-                                box.x2 = xmax;
-                                box.y2 = ymax;
-                                box.cx = (xmin + xmax) * 0.5f;
-                                box.cy = (ymin + ymax) * 0.5f;
-                                box.w = bw;
-                                box.h = bh;
-                                box.score = prob;
-
-                                // Suppress flat planar architecture hallucinations (doors, walls, floors, tables)
-                                // Human heads are dense with micro-edges (eyes, nose, mouth, hair):
-                                // true head texture energy is >= 4.20 even in dark rooms (mean 14.80).
-                                // Flat doors and planar surfaces have texture energy <= 2.88.
-                                float tex_energy = compute_texture_energy(input, box);
-                                float min_tex = (feature_idx == 0) ? 3.5f : 2.8f;
-                                if (tex_energy < min_tex) {
-                                    xptr++; yptr++; wptr++; hptr++; score_ptr++;
-                                    continue;
-                                }
-
-                                candidates.push_back(box);
-                            }
-                        }
-                    }
-
-                    xptr++;
-                    yptr++;
-                    wptr++;
-                    hptr++;
-                    score_ptr++;
-                }
-            }
+        // On borderline proposals, ensure minimal spatial texture energy to suppress flat surfaces
+        if (prob < 0.55f) {
+            float tex_energy = compute_texture_energy(input, box);
+            if (tex_energy < 2.5f) continue;
         }
+
+        candidates.push_back(box);
     }
 
     std::vector<HeadBox> picked;

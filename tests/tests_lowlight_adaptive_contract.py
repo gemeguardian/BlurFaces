@@ -24,8 +24,9 @@ class LowLightAdaptiveContract(unittest.TestCase):
         self.assertIn("bw < 0.11f || bh < 0.13f", HEAD_CPP)
         self.assertIn("prob < 0.38f", HEAD_CPP)
 
-    def test_head_detector_suppresses_micro_scale_f2_clutter(self):
-        self.assertIn("for (int feature_idx = 0; feature_idx < 2; ++feature_idx)", HEAD_CPP)
+    def test_head_detector_uses_anchor_free_yolov8_decoder(self):
+        self.assertIn('ex.extract("out0", out)', HEAD_CPP)
+        self.assertIn("out.row(4)", HEAD_CPP)
 
     def test_bytetrack_suppresses_transient_ghost_coasting(self):
         self.assertIn("frames_tracked() >= 4", BYTE_CPP)
