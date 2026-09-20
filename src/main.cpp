@@ -106,15 +106,15 @@ Java_com_makey_blurfaces_g2_NativeBridge_process(JNIEnv* env, jclass,
     // high_thresh: threshold for high-confidence detections
     // low_thresh: floor for ByteTrack stage 2 matching
     // instant_thresh: threshold for single-frame instant activation
-    float high_thresh = std::max(0.20f, std::min(0.60f, min_conf));
-    float low_thresh = std::max(0.15f, high_thresh * 0.60f);
-    float instant_thresh = std::max(0.40f, std::min(0.70f, high_thresh + 0.15f));
+    float high_thresh = std::max(0.18f, std::min(0.50f, min_conf));
+    float low_thresh = std::max(0.12f, high_thresh * 0.55f);
+    float instant_thresh = std::max(0.35f, std::min(0.60f, high_thresh + 0.05f));
 
     // Run NCNN Head Detection with low_thresh as detection floor
     std::vector<HeadBox> detected_heads;
     g_detector->detect(pixels, width, height, detected_heads, low_thresh, 0.45f);
 
-    // Update ByteTrack multi-object tracker (returns only confirmed active tracks)
+    // Update ByteTrack multi-object tracker (returns confirmed active and coasting tracks)
     std::vector<STrack> active_tracks = g_tracker->update(detected_heads, high_thresh, low_thresh, instant_thresh);
 
     int count = std::min(static_cast<int>(active_tracks.size()), max_faces);
@@ -127,7 +127,7 @@ Java_com_makey_blurfaces_g2_NativeBridge_process(JNIEnv* env, jclass,
             active_tracks[i].get_geometry(geom_buffer.data() + i * 6);
             float score = active_tracks[i].score();
             if (active_tracks[i].state() == TrackState::Lost) {
-                score *= 0.5f;
+                score = std::max(0.25f, score * 0.85f);
             }
             score_buffer[i] = score;
             LOGI("[Face #%d] score=%.2f center=(%.2f, %.2f) radius=(%.2f, %.2f)",

@@ -489,11 +489,18 @@ std::vector<STrack> ByteTracker::update(const std::vector<HeadBox>& detections,
     }
     tracked_stracks_ = next_tracked;
 
-    // Step 7: Output confirmed active tracks only
+    // Step 7: Output confirmed active tracks only (including coasting lost tracks)
     std::vector<STrack> output_tracks;
-    output_tracks.reserve(tracked_stracks_.size());
+    output_tracks.reserve(tracked_stracks_.size() + lost_stracks_.size());
     for (const auto& trk : tracked_stracks_) {
         if (trk.is_activated()) {
+            output_tracks.push_back(trk);
+        }
+    }
+    for (const auto& trk : lost_stracks_) {
+        // Coast lost tracks with Kalman prediction for up to 12 frames (~380ms)
+        // to prevent blur flickering during momentary detector drops or head turns.
+        if (trk.is_activated() && trk.frames_lost() <= 12) {
             output_tracks.push_back(trk);
         }
     }
