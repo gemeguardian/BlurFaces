@@ -112,7 +112,9 @@ bool verify_head_chrominance(const unsigned char* rgba, int img_w, int img_h,
             sum_r += r;
             sum_b += b;
 
-            if (cb >= 77 && cb <= 127 && cr >= 133 && cr <= 173) {
+            // Biological skin test across all ethnicities (Fitzpatrick types I through VI)
+            // Melanin & hemoglobin optical laws dictate R > B and Cr >= 129
+            if (cb >= 77 && cb <= 130 && cr >= 129 && cr <= 175 && r > b) {
                 skin_hits++;
             }
         }
@@ -123,11 +125,11 @@ bool verify_head_chrominance(const unsigned char* rgba, int img_w, int img_h,
     int rb_diff = (sum_r - sum_b) / total_samples;
 
     if (feature_idx == 0) {
-        if (skin_ratio < 0.18f || cr_mean < 130.0f || rb_diff < 1) return false;
+        if (skin_ratio < 0.15f || cr_mean < 129.0f || rb_diff < 1) return false;
     } else if (feature_idx == 1) {
-        if (skin_ratio < 0.12f || cr_mean < 129.5f || rb_diff < 0) return false;
+        if (skin_ratio < 0.10f || cr_mean < 128.5f || rb_diff < 0) return false;
     } else {
-        if (skin_ratio < 0.25f || cr_mean < 132.0f || rb_diff < 1) return false;
+        if (skin_ratio < 0.20f || cr_mean < 130.0f || rb_diff < 1) return false;
     }
 
     return true;
