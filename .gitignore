@@ -6,6 +6,8 @@
 /BlurFaces/assets/model/
 /.gradle/
 /.cxx/
+/obj/
+/libs/arm64-v8a/libblur_faces.so
 
 # Local Android/Gradle machine configuration
 /local.properties

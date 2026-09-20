@@ -19,7 +19,9 @@ class CameraBlurControlContract(unittest.TestCase):
         self.assertIn("zoomSlider.getY() + zoomSlider.getHeight() - AndroidUtilities.dp(8)", control)
         self.assertIn("Gravity.TOP | Gravity.CENTER_HORIZONTAL", control)
         self.assertIn("ViewTreeObserver.OnPreDrawListener", control)
-        self.assertIn("pill.setAlpha(zoomSlider.getAlpha())", control)
+        self.assertIn("pill.setAlpha(alpha)", control)
+        self.assertIn("cameraBottom + AndroidUtilities.dp(16)", control)
+        self.assertIn("setBlurBackground", MAIN)
         self.assertNotIn("pill.setVisibility(zoomSlider.getVisibility())", control)
 
     def test_control_follows_theme_and_has_tactile_selected_state(self):
@@ -73,6 +75,48 @@ class CameraBlurControlContract(unittest.TestCase):
         self.assertIn("0xFFE53935", control)
         self.assertIn('"Face blur active (degraded)"', control)
         self.assertIn('"Blur faces"', control)
+
+    def test_dynamic_icon_pack_detection_and_svgs(self):
+        self.assertIn("SVG_TG_BLUR", MAIN)
+        self.assertIn("SVG_TG_BLUR_OFF", MAIN)
+        self.assertIn("SVG_SOLAR_BLUR", MAIN)
+        self.assertIn("SVG_SOLAR_BLUR_OFF", MAIN)
+        self.assertIn("SVG_REMIX_BLUR", MAIN)
+        self.assertIn("SVG_REMIX_BLUR_OFF", MAIN)
+        self.assertIn("detectActiveIconPack", MAIN)
+        self.assertIn("ExteraConfig.getIconPack()", MAIN)
+        self.assertIn('"SOLAR"', MAIN)
+        self.assertIn('"REMIX"', MAIN)
+        self.assertIn('"DEFAULT"', MAIN)
+        self.assertIn("renderSvgToBitmap", MAIN)
+        self.assertIn("getBlurIconDrawable", MAIN)
+        control = MAIN[MAIN.index("private static final class BlurControl") :]
+        self.assertIn("updateIcons()", control)
+
+    def test_embedded_svgs_match_user_icons(self):
+        icons_dir = pathlib.Path("/tmp/user_icons")
+        if icons_dir.exists():
+            import re
+            def extract_constant(name):
+                m = re.search(r'String\s+' + name + r'\s*=\s*(.*?);', MAIN, re.DOTALL)
+                if not m:
+                    return ''
+                expr = m.group(1)
+                parts = re.findall(r'"((?:[^"\\]|\\.)*)"', expr)
+                return ''.join(parts).encode('utf-8').decode('unicode_escape')
+
+            const_map = {
+                'tg_blur.svg': 'SVG_TG_BLUR',
+                'tg_blur_off.svg': 'SVG_TG_BLUR_OFF',
+                'solar_blur.svg': 'SVG_SOLAR_BLUR',
+                'solar_blur_off.svg': 'SVG_SOLAR_BLUR_OFF',
+                'remix_blur.svg': 'SVG_REMIX_BLUR',
+                'remix_blur_off.svg': 'SVG_REMIX_BLUR_OFF'
+            }
+            for file_name, const_name in const_map.items():
+                raw = (icons_dir / file_name).read_text().strip()
+                extracted = extract_constant(const_name).strip()
+                self.assertEqual(raw, extracted, f"{file_name} does not match {const_name}")
 
 
 if __name__ == "__main__":

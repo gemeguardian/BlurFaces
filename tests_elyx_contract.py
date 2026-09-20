@@ -57,20 +57,19 @@ selector_calls = [
     and isinstance(node.func, ast.Name)
     and node.func.id == "Selector"
 ]
-assert len(selector_calls) == 4
+assert len(selector_calls) == 3
 assert all("subtext" not in {keyword.arg for keyword in call.keywords} for call in selector_calls)
 assert 'key="detection_range"' in main_source
-assert 'Divider(text=strings.get("settings_width_subtext"))' in main_source
 assert "DexRuntime" in main_source
 assert "from .asset_hashes import ASSET_HASHES" in runtime_source
 assert "http://" not in runtime_source
 assert 'context.getDir("blur_faces_runtime_v3", 0)' in runtime_source
-assert "def get_model_settings_bridge():" in runtime_source
-assert "get_model_settings_bridge()" in runtime_source
 assert 'dex_class.getMethod("clearLogger").invoke(None)' in runtime_source
 assert 'getMethod("setLogger", consumer_type).invoke(None, None)' not in runtime_source
-assert "def download_model(plugin, model_index, progress_callback=None, is_current=None):" in runtime_source
-assert "def delete_model(plugin, model_index):" in runtime_source
+assert "download_model" not in runtime_source
+assert "delete_model" not in runtime_source
+assert "is_model_downloaded" not in runtime_source
+assert "switch_model" not in runtime_source
 assert "ModelSettingsBridge" in bridge_source
 assert "ModelRadioCell extends FrameLayout" in bridge_source
 assert "CustomSetting.Factory<ModelRadioCell>" in bridge_source
@@ -94,10 +93,9 @@ assert '"core_" + CORE_BUNDLE_ID' in runtime_source
 assert 'LOADER_ABI_SALT = "ncnn-native-v3"' in runtime_source
 assert '_REGISTRY_KEY = "_blur_faces_ncnn_runtime_v3"' in runtime_source
 assert 'if loaded_epoch > _MODULE_EPOCH:' in runtime_source
-assert '"_blur_faces_mediapipe_runtime_v3",' in runtime_source
+assert "_blur_faces_mediapipe_runtime" not in runtime_source
 assert "os.makedirs(native_dir, exist_ok=True)" in runtime_source
 assert "def _release_loaded_core(registry):" in runtime_source
-assert 'registry["settings_bridge_class"] = None' in runtime_source
 assert 'registry["core_loader"] = None' in runtime_source
 assert 'registry["core_load_token"] = _CORE_LOAD_TOKEN' in runtime_source
 

@@ -127,7 +127,7 @@ Java_com_makey_blurfaces_g2_NativeBridge_process(JNIEnv* env, jclass,
             active_tracks[i].get_geometry(geom_buffer.data() + i * 6);
             float score = active_tracks[i].score();
             if (active_tracks[i].state() == TrackState::Lost) {
-                score *= 0.5f;
+                score = std::max(0.22f, score * 0.75f);
             }
             score_buffer[i] = score;
             LOGI("[Face #%d] score=%.2f center=(%.2f, %.2f) radius=(%.2f, %.2f)",

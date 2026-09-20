@@ -31,9 +31,7 @@ class BlurFacesPlugin(BasePlugin):
         self.log("[BlurFaces] Plugin loading...")
         self._loaded = True
         self.enabled = bool(self.get_setting("enabled", True))
-        self.round_video_width_index = self._valid_width_index(
-            self.get_setting("round_video_width", 0)
-        )
+        self.round_video_width_index = 0
         self.face_mask_index = self._valid_mask_index(self.get_setting("face_mask_size", 2))
         self.detection_range_index = self._valid_range_index(
             self.get_setting("detection_range", 0)
@@ -51,12 +49,10 @@ class BlurFacesPlugin(BasePlugin):
         runtime = None
         try:
             runtime = DexRuntime(
-                self,
-                ROUND_VIDEO_WIDTHS[self.round_video_width_index],
-                FACE_MASK_SCALES[self.face_mask_index],
-                DETECTION_CONFIDENCES[self.detection_range_index],
-                False,
-                0,
+                plugin=self,
+                round_video_width=ROUND_VIDEO_WIDTHS[self.round_video_width_index],
+                face_mask_scale=FACE_MASK_SCALES[self.face_mask_index],
+                detection_confidence=DETECTION_CONFIDENCES[self.detection_range_index],
             )
             if not runtime.stage_and_start():
                 return
@@ -138,28 +134,6 @@ class BlurFacesPlugin(BasePlugin):
                 on_change=self._on_range_change,
             ),
             Divider(text=strings.get("settings_range_subtext")),
-            Header(strings.get("settings_width")),
-            Selector(
-                key="round_video_width",
-                text=strings.get("settings_width"),
-                icon="msg_media",
-                default=self.round_video_width_index,
-                items=[
-                    strings.get("width_auto"),
-                    strings.get("width_fast"),
-                    strings.get("width_balanced"),
-                    strings.get("width_quality"),
-                    strings.get("width_maximum"),
-                ],
-                on_change=self._on_width_change,
-            ),
-            Divider(text=strings.get("settings_width_subtext")),
-            Text(
-                text=strings.get("settings_self_test"),
-                icon="msg_shield",
-                on_click=self._on_self_test_click,
-            ),
-            Divider(text=strings.get("settings_self_test_subtext")),
         ]
 
     @staticmethod
@@ -290,12 +264,10 @@ class BlurFacesPlugin(BasePlugin):
         else:
             try:
                 temp_runtime = DexRuntime(
-                    self,
-                    ROUND_VIDEO_WIDTHS[self.round_video_width_index],
-                    FACE_MASK_SCALES[self.face_mask_index],
-                    DETECTION_CONFIDENCES[self.detection_range_index],
-                    False,
-                    0,
+                    plugin=self,
+                    round_video_width=ROUND_VIDEO_WIDTHS[self.round_video_width_index],
+                    face_mask_scale=FACE_MASK_SCALES[self.face_mask_index],
+                    detection_confidence=DETECTION_CONFIDENCES[self.detection_range_index],
                 )
                 if hasattr(temp_runtime, "run_privacy_self_test"):
                     result = temp_runtime.run_privacy_self_test(mask_scale, mask_mode)

@@ -27,8 +27,8 @@ class ReconfigureReloadContract(unittest.TestCase):
         self.assertIn('self.set_setting("detection_range", range_index)', PLUGIN)
 
     def test_hot_reload_registry_reuses_compatible_runtime(self):
-        self.assertIn("_LEGACY_REGISTRY_KEYS", RUNTIME)
-        self.assertIn("delattr(sys, key)", RUNTIME)
+        self.assertNotIn("_LEGACY_REGISTRY_KEYS", RUNTIME)
+        self.assertNotIn("_blur_faces_mediapipe_runtime", RUNTIME)
         self.assertIn("_cancel_deferred_shutdown(registry)", RUNTIME)
         self.assertIn("The process-global Java runtime and hooks survive", RUNTIME)
         self.assertIn('registry.get("core_bundle_id") == CORE_BUNDLE_ID', RUNTIME)

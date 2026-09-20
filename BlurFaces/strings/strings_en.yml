@@ -24,5 +24,3 @@ settings_range_subtext: "Higher sensitivity accepts less distinct faces. For pri
 range_normal: "Normal"
 range_extended: "Increased"
 range_far: "High"
-settings_self_test: "Test protection"
-settings_self_test_subtext: "Runs an on-device privacy verification test to verify face redaction and feature destruction"

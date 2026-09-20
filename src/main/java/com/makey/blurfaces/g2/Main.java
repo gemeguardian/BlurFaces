@@ -1,7 +1,14 @@
 package com.makey.blurfaces.g2;
 
-import android.graphics.SurfaceTexture;
+import android.content.Context;
+import android.content.SharedPreferences;
+import android.graphics.Bitmap;
+import android.graphics.Canvas;
 import android.graphics.PorterDuff;
+import android.graphics.SurfaceTexture;
+import android.graphics.drawable.BitmapDrawable;
+import android.graphics.drawable.Drawable;
+import android.media.MediaCodec;
 import android.opengl.EGL14;
 import android.opengl.GLES20;
 import android.util.Log;
@@ -14,18 +21,27 @@ import android.widget.FrameLayout;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 
+import com.caverock.androidsvg.SVG;
+import com.exteragram.messenger.ExteraConfig;
+import com.exteragram.messenger.IconPackType;
+
 // MediaPipe imports removed - native NCNN HeadDetector + ByteTrack v3.0
 
+import java.io.ByteArrayInputStream;
 import java.io.FileInputStream;
+import java.io.InputStream;
+import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.FloatBuffer;
 import java.nio.channels.FileChannel;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.WeakHashMap;
 import java.util.concurrent.ArrayBlockingQueue;
@@ -46,6 +62,7 @@ import de.robv.android.xposed.XposedBridge;
 import org.telegram.messenger.AndroidUtilities;
 import org.telegram.messenger.ApplicationLoader;
 import org.telegram.messenger.R;
+import org.telegram.messenger.SvgHelper;
 import org.telegram.ui.ActionBar.Theme;
 
 /** Round-video face blur whose sole geometry source is MediaPipe Face Landmarker. */
@@ -97,7 +114,7 @@ public final class Main {
     // the long window here would blur a later face-free recording for no reason.
     static final long FLIP_GRACE_NS = 1_500_000_000L;
     static final long CAMERA_SWITCH_SETTLE_NS = 2_500_000_000L;
-    static final int CAMERA_SWITCH_BARRIER_MIN_FRAMES = 1;
+    static final int CAMERA_SWITCH_BARRIER_MIN_FRAMES = 3;
     private static final AtomicLong LAST_CAMERA_SWITCH_NANOS = new AtomicLong();
     private static final AtomicInteger CAMERA_SWITCH_BARRIER_FRAMES = new AtomicInteger(100);
     private static final AtomicInteger ENCODER_SWITCH_BARRIER_FRAMES = new AtomicInteger(100);
@@ -584,6 +601,7 @@ public final class Main {
             hookSurfaceUpdates();
             hookCameraRenderer();
             hookEncoderRenderer();
+            hookEncoderFallback();
             acceptingFrames = true;
             initialized = true;
             setProtectionState("ACTIVE");
@@ -718,6 +736,26 @@ public final class Main {
                 }
             }));
         } catch (Throwable ignored) { }
+        try {
+            Class<?> factoryType = Class.forName(
+                    "org.telegram.ui.Components.blur3.BlurredBackgroundDrawableViewFactory",
+                    false, Main.class.getClassLoader());
+            Class<?> colorProviderType = Class.forName(
+                    "org.telegram.ui.Components.blur3.drawable.color.BlurredBackgroundColorProvider",
+                    false, Main.class.getClassLoader());
+            Method setButtonsBackground = type.getDeclaredMethod("setButtonsBackground", factoryType, colorProviderType);
+            setButtonsBackground.setAccessible(true);
+            HOOKS.add(XposedBridge.hookMethod(setButtonsBackground, new XC_MethodHook() {
+                @Override public void afterHookedMethod(MethodHookParam param) {
+                    synchronized (BLUR_CONTROLS) {
+                        BlurControl control = BLUR_CONTROLS.get(param.thisObject);
+                        if (control != null) {
+                            control.setBlurBackground(param.args[0], param.args[1]);
+                        }
+                    }
+                }
+            }));
+        } catch (Throwable ignored) { }
         emit("Round-camera blur toggle ready");
     }
 
@@ -734,10 +772,33 @@ public final class Main {
             if (!(cameraView instanceof FrameLayout)) return;
             Method getZoomSlider = cameraView.getClass().getMethod("getZoomSlider");
             View zoomSlider = (View) getZoomSlider.invoke(cameraView);
+            View cameraContainer = null;
+            try {
+                cameraContainer = (View) field(cameraView.getClass(), "cameraContainer").get(cameraView);
+            } catch (Throwable ignored) { }
             Theme.ResourcesProvider resourcesProvider =
                     (Theme.ResourcesProvider) field(cameraView.getClass(), "resourcesProvider").get(cameraView);
             BlurControl control = new BlurControl(
-                    (FrameLayout) cameraView, zoomSlider, resourcesProvider);
+                    (FrameLayout) cameraView, cameraContainer, zoomSlider, resourcesProvider);
+            try {
+                View buttonsLayout = (View) field(cameraView.getClass(), "buttonsLayout").get(cameraView);
+                if (buttonsLayout != null && buttonsLayout.getBackground() != null) {
+                    Drawable bg = buttonsLayout.getBackground();
+                    if (bg.getClass().getName().contains("BlurredBackgroundDrawable")) {
+                        Method getSource = bg.getClass().getMethod("getSource");
+                        Object source = getSource.invoke(bg);
+                        Object colorProvider = field(bg.getClass(), "colorProvider").get(bg);
+                        Class<?> factoryClass = Class.forName(
+                                "org.telegram.ui.Components.blur3.BlurredBackgroundDrawableViewFactory",
+                                false, Main.class.getClassLoader());
+                        Constructor<?> ctor = factoryClass.getConstructor(
+                                Class.forName("org.telegram.ui.Components.blur3.source.BlurredBackgroundSource",
+                                        false, Main.class.getClassLoader()));
+                        Object factory = ctor.newInstance(source);
+                        control.setBlurBackground(factory, colorProvider);
+                    }
+                }
+            } catch (Throwable ignored) { }
             synchronized (BLUR_CONTROLS) { BLUR_CONTROLS.put(cameraView, control); }
             // Privacy-first default for every newly opened round camera.
             setBlurEnabled(true);
@@ -877,6 +938,39 @@ public final class Main {
             emit("Encoder hooks registered: surface create/draw/destroy");
         } catch (Throwable error) {
             emit("Encoder blur unavailable; preview remains active and encoder is untouched", error);
+        }
+    }
+
+    private static void hookEncoderFallback() {
+        try {
+            Method createEncoder = MediaCodec.class.getDeclaredMethod("createEncoderByType", String.class);
+            HOOKS.add(XposedBridge.hookMethod(createEncoder, new XC_MethodHook() {
+                @Override
+                public void afterHookedMethod(MethodHookParam param) {
+                    if (param.hasThrowable() && "video/avc".equals(param.args[0])) {
+                        try {
+                            MediaCodec fallback = MediaCodec.createByCodecName("c2.android.avc.encoder");
+                            param.setResult(fallback);
+                            param.setThrowable(null);
+                            emit("Hardware video encoder failed to create; fell back to CPU c2.android.avc.encoder");
+                            return;
+                        } catch (Throwable t1) {
+                            try {
+                                MediaCodec fallback = MediaCodec.createByCodecName("OMX.google.h264.encoder");
+                                param.setResult(fallback);
+                                param.setThrowable(null);
+                                emit("Hardware video encoder failed to create; fell back to CPU OMX.google.h264.encoder");
+                                return;
+                            } catch (Throwable t2) {
+                                emit("Software video encoder fallback failed", t2);
+                            }
+                        }
+                    }
+                }
+            }));
+            emit("Encoder fallback hook registered: hardware -> CPU fallback");
+        } catch (Throwable error) {
+            emit("Encoder fallback hook unavailable", error);
         }
     }
 
@@ -1247,6 +1341,58 @@ public final class Main {
         }
     }
 
+    private static java.io.File getDebugDir() {
+        try {
+            java.io.File base = null;
+            try {
+                Class<?> appLoader = Class.forName("org.telegram.messenger.ApplicationLoader");
+                Method method = appLoader.getDeclaredMethod("getFilesDirFixed");
+                base = (java.io.File) method.invoke(null);
+            } catch (Throwable ignored) { }
+            if (base == null) {
+                base = new java.io.File("/data/data/com.exteragram.messenger/files");
+            }
+            java.io.File dir = new java.io.File(base, "blurfaces_storage");
+            if (!dir.exists()) dir.mkdirs();
+            return dir;
+        } catch (Throwable t) {
+            java.io.File fallback = new java.io.File("/data/data/com.exteragram.messenger/files/blurfaces_storage");
+            if (!fallback.exists()) fallback.mkdirs();
+            return fallback;
+        }
+    }
+
+    private static long lastDebugFrameSavedNanos = 0L;
+    private static void maybeSaveDebugFrame(ByteBuffer rgba, int count, float score, float cx, float cy) {
+        long now = System.nanoTime();
+        long minInterval = (count > 0) ? 400_000_000L : 1_500_000_000L;
+        if (now - lastDebugFrameSavedNanos < minInterval) return;
+        lastDebugFrameSavedNanos = now;
+        try {
+            java.io.File dir = getDebugDir();
+            ByteBuffer copy = ByteBuffer.allocateDirect(rgba.capacity());
+            rgba.position(0);
+            copy.put(rgba);
+            rgba.position(0);
+            copy.position(0);
+            new Thread(() -> {
+                try {
+                    android.graphics.Bitmap bmp = android.graphics.Bitmap.createBitmap(
+                            CleanFrameTap.SIZE, CleanFrameTap.SIZE, android.graphics.Bitmap.Config.ARGB_8888);
+                    bmp.copyPixelsFromBuffer(copy);
+                    long ts = System.currentTimeMillis();
+                    java.io.File file = new java.io.File(dir, String.format(java.util.Locale.US,
+                            "frame_%d_c%d_s%d_y%d.jpg", ts, count, (int)(score * 100), (int)(cy * 100)));
+                    try (java.io.FileOutputStream out = new java.io.FileOutputStream(file)) {
+                        bmp.compress(android.graphics.Bitmap.CompressFormat.JPEG, 88, out);
+                    }
+                    bmp.recycle();
+                    emit("Saved clean debug frame: " + file.getName());
+                } catch (Throwable ignored) { }
+            }).start();
+        } catch (Throwable ignored) { }
+    }
+
     private static void submitLatestFrame() {
         CapturedFrame frame = LATEST_FRAME.getAndSet(null);
         if (frame == null) { DRAIN_SCHEDULED.set(false); return; }
@@ -1267,6 +1413,9 @@ public final class Main {
 
             int count = NativeBridge.process(frame.rgba, CleanFrameTap.SIZE, CleanFrameTap.SIZE,
                     outGeometry, outScores, outYaws, MAX_FACES, configuredConfidence);
+
+            maybeSaveDebugFrame(frame.rgba, count, count > 0 ? outScores[0] : 0f,
+                    count > 0 ? outGeometry[0] : 0f, count > 0 ? outGeometry[1] : 0f);
 
             FaceGeometry detections = new FaceGeometry(outGeometry, outScores, outYaws, count,
                     frame.captureNanos, frame.sourceKey);
@@ -1992,21 +2141,189 @@ public final class Main {
         }
     }
 
+    public static final String SVG_TG_BLUR =
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"24\" height=\"24\" viewBox=\"0 0 24 24\" fill=\"none\">\n" +
+            "<circle cx=\"12\" cy=\"12\" r=\"9\" stroke=\"currentColor\" stroke-width=\"1.8\"/>\n" +
+            "<circle cx=\"12\" cy=\"7.5\" r=\"1.5\" fill=\"currentColor\"/>\n" +
+            "<circle cx=\"12\" cy=\"12\" r=\"1.9\" fill=\"currentColor\"/>\n" +
+            "<circle cx=\"12\" cy=\"16.5\" r=\"1.3\" fill=\"currentColor\"/>\n" +
+            "<circle cx=\"8.2\" cy=\"9.8\" r=\"1.1\" fill=\"currentColor\"/>\n" +
+            "<circle cx=\"15.8\" cy=\"9.8\" r=\"1.1\" fill=\"currentColor\"/>\n" +
+            "<circle cx=\"8.2\" cy=\"14.2\" r=\"1\" fill=\"currentColor\"/>\n" +
+            "<circle cx=\"15.8\" cy=\"14.2\" r=\"1\" fill=\"currentColor\"/>\n" +
+            "</svg>";
+
+    public static final String SVG_TG_BLUR_OFF =
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"24\" height=\"24\" viewBox=\"0 0 24 24\" fill=\"none\">\n" +
+            "<mask id=\"cut\"><rect width=\"24\" height=\"24\" fill=\"#fff\"/>\n" +
+            "<path d=\"M4.5 19.5 19.5 4.5\" stroke=\"#000\" stroke-width=\"4\" stroke-linecap=\"round\"/></mask>\n" +
+            "<circle cx=\"12\" cy=\"12\" r=\"9\" stroke=\"currentColor\" stroke-width=\"1.8\" mask=\"url(#cut)\"/>\n" +
+            "<path d=\"M4.5 19.5 19.5 4.5\" stroke=\"currentColor\" stroke-width=\"1.8\" stroke-linecap=\"round\"/>\n" +
+            "</svg>";
+
+    public static final String SVG_SOLAR_BLUR =
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"24\" height=\"24\" viewBox=\"0 0 24 24\" fill=\"none\">\n" +
+            "<g fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.5\" stroke-linecap=\"round\">\n" +
+            "<path d=\"M12 3.2a8.8 8.8 0 0 1 0 17.6\"/><path d=\"M9 3.7a8.8 8.8 0 0 0-1.9 1\"/>\n" +
+            "<path d=\"M4.4 7.5a8.8 8.8 0 0 0-.9 2.3\"/><path d=\"M3.3 13.1a8.8 8.8 0 0 0 1 2.6\"/>\n" +
+            "<path d=\"M6.4 18.3a8.8 8.8 0 0 0 2.3 1.4\"/></g>\n" +
+            "<circle cx=\"12\" cy=\"8.8\" r=\"1.25\" fill=\"currentColor\"/>\n" +
+            "<circle cx=\"12\" cy=\"13.2\" r=\"1.6\" fill=\"currentColor\"/>\n" +
+            "<circle cx=\"8.6\" cy=\"11.4\" r=\".95\" fill=\"currentColor\"/>\n" +
+            "<circle cx=\"15.4\" cy=\"11.4\" r=\".95\" fill=\"currentColor\"/>\n" +
+            "</svg>";
+
+    public static final String SVG_SOLAR_BLUR_OFF =
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"24\" height=\"24\" viewBox=\"0 0 24 24\" fill=\"none\">\n" +
+            "<mask id=\"cut\"><rect width=\"24\" height=\"24\" fill=\"#fff\"/>\n" +
+            "<path d=\"M4.8 19.2 19.2 4.8\" stroke=\"#000\" stroke-width=\"3.6\" stroke-linecap=\"round\"/></mask>\n" +
+            "<g fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.5\" stroke-linecap=\"round\" mask=\"url(#cut)\">\n" +
+            "<path d=\"M12 3.2a8.8 8.8 0 0 1 0 17.6\"/><path d=\"M9 3.7a8.8 8.8 0 0 0-1.9 1\"/>\n" +
+            "<path d=\"M4.4 7.5a8.8 8.8 0 0 0-.9 2.3\"/><path d=\"M3.3 13.1a8.8 8.8 0 0 0 1 2.6\"/>\n" +
+            "<path d=\"M6.4 18.3a8.8 8.8 0 0 0 2.3 1.4\"/></g>\n" +
+            "<path d=\"M4.8 19.2 19.2 4.8\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.5\" stroke-linecap=\"round\"/>\n" +
+            "</svg>";
+
+    public static final String SVG_REMIX_BLUR =
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"24\" height=\"24\" viewBox=\"0 0 24 24\" fill=\"none\">\n" +
+            "<path d=\"M12 2.4c3.3 3.3 6.8 6.5 6.8 10.6A6.8 6.8 0 0 1 12 19.8a6.8 6.8 0 0 1-6.8-6.8C5.2 8.9 8.7 5.7 12 2.4Z\" fill=\"currentColor\"/>\n" +
+            "</svg>";
+
+    public static final String SVG_REMIX_BLUR_OFF =
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"24\" height=\"24\" viewBox=\"0 0 24 24\" fill=\"none\">\n" +
+            "<mask id=\"cut\"><rect width=\"24\" height=\"24\" fill=\"#fff\"/>\n" +
+            "<path d=\"M3.6 20.4 20.4 3.6\" stroke=\"#000\" stroke-width=\"4.2\" stroke-linecap=\"round\"/></mask>\n" +
+            "<path d=\"M12 2.4c3.3 3.3 6.8 6.5 6.8 10.6A6.8 6.8 0 0 1 12 19.8a6.8 6.8 0 0 1-6.8-6.8C5.2 8.9 8.7 5.7 12 2.4Z\" fill=\"currentColor\" mask=\"url(#cut)\"/>\n" +
+            "<path d=\"M3.6 20.4 20.4 3.6\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/>\n" +
+            "</svg>";
+
+    private static final Map<String, Bitmap> ICON_BITMAP_CACHE = new ConcurrentHashMap<>();
+
+    public static String detectActiveIconPack() {
+        try {
+            IconPackType pack = ExteraConfig.getIconPack();
+            if (pack != null) {
+                String name = pack.name();
+                if (name != null) {
+                    String upper = name.toUpperCase(Locale.US);
+                    if (upper.contains("SOLAR")) return "SOLAR";
+                    if (upper.contains("REMIX")) return "REMIX";
+                    if (upper.contains("DEFAULT")) return "DEFAULT";
+                }
+            }
+        } catch (Throwable ignored) { }
+
+        try {
+            Class<?> configClass = Class.forName("com.exteragram.messenger.ExteraConfig", false, Main.class.getClassLoader());
+            Method getIconPack = configClass.getMethod("getIconPack");
+            Object pack = getIconPack.invoke(null);
+            if (pack != null) {
+                String name = pack.toString().toUpperCase(Locale.US);
+                if (name.contains("SOLAR")) return "SOLAR";
+                if (name.contains("REMIX")) return "REMIX";
+                if (name.contains("DEFAULT")) return "DEFAULT";
+            }
+        } catch (Throwable ignored) { }
+
+        try {
+            Context ctx = ApplicationLoader.applicationContext;
+            if (ctx != null) {
+                SharedPreferences prefs = ctx.getSharedPreferences("exteraconfig", Context.MODE_PRIVATE);
+                int packInt = prefs.getInt("iconPack", -1);
+                if (packInt == 1) return "SOLAR";
+                if (packInt == 2) return "REMIX";
+                String layout = prefs.getString("iconPacksLayout", "");
+                if (layout != null) {
+                    String lower = layout.toLowerCase(Locale.US);
+                    if (lower.contains("solar")) return "SOLAR";
+                    if (lower.contains("remix")) return "REMIX";
+                }
+            }
+        } catch (Throwable ignored) { }
+
+        return "DEFAULT";
+    }
+
+    public static Bitmap renderSvgToBitmap(String svgXml, int sizeDp) {
+        if (svgXml == null) return null;
+        int px = Math.max(1, AndroidUtilities.dp(sizeDp));
+        String normalizedXml = svgXml.replace("currentColor", "#ffffff");
+
+        // Primary: com.caverock.androidsvg.SVG
+        try {
+            InputStream is = new ByteArrayInputStream(normalizedXml.getBytes(StandardCharsets.UTF_8));
+            SVG svg = SVG.getFromInputStream(is);
+            if (svg != null) {
+                Bitmap bitmap = Bitmap.createBitmap(px, px, Bitmap.Config.ARGB_8888);
+                Canvas canvas = new Canvas(bitmap);
+                svg.setDocumentWidth(px);
+                svg.setDocumentHeight(px);
+                svg.renderToCanvas(canvas);
+                return bitmap;
+            }
+        } catch (Throwable t) {
+            emit("renderSvgToBitmap AndroidSVG error: " + t.getMessage(), t);
+        }
+
+        // Secondary: Telegram SvgHelper
+        try {
+            Bitmap bitmap = SvgHelper.getBitmap(normalizedXml, px, px, false);
+            if (bitmap != null) {
+                return bitmap;
+            }
+        } catch (Throwable t) {
+            emit("renderSvgToBitmap SvgHelper error: " + t.getMessage(), t);
+        }
+
+        return null;
+    }
+
+    public static Drawable getBlurIconDrawable(Context context, String pack, boolean blurOn) {
+        if (context == null) return null;
+        int px = Math.max(1, AndroidUtilities.dp(24));
+        String cacheKey = pack + "_" + (blurOn ? "on" : "off") + "_" + px;
+        Bitmap cached = ICON_BITMAP_CACHE.get(cacheKey);
+        if (cached != null && !cached.isRecycled()) {
+            return new BitmapDrawable(context.getResources(), cached);
+        }
+
+        String svgXml;
+        if ("SOLAR".equals(pack)) {
+            svgXml = blurOn ? SVG_SOLAR_BLUR : SVG_SOLAR_BLUR_OFF;
+        } else if ("REMIX".equals(pack)) {
+            svgXml = blurOn ? SVG_REMIX_BLUR : SVG_REMIX_BLUR_OFF;
+        } else {
+            svgXml = blurOn ? SVG_TG_BLUR : SVG_TG_BLUR_OFF;
+        }
+
+        Bitmap rendered = renderSvgToBitmap(svgXml, 24);
+        if (rendered != null) {
+            ICON_BITMAP_CACHE.put(cacheKey, rendered);
+            return new BitmapDrawable(context.getResources(), rendered);
+        }
+
+        return null;
+    }
+
     private static final class BlurControl {
         final FrameLayout host;
+        final View cameraContainer;
         final View zoomSlider;
         final FrameLayout pill;
         final View selector;
         final Theme.ResourcesProvider resourcesProvider;
         final ImageView blurButton;
         final ImageView clearButton;
+        private Drawable blurBackgroundDrawable;
+        private String currentIconPack = null;
         final ViewTreeObserver.OnPreDrawListener positionListener = () -> {
             updatePosition();
             return true;
         };
 
-        BlurControl(FrameLayout host, View zoomSlider, Theme.ResourcesProvider resourcesProvider) {
+        BlurControl(FrameLayout host, View cameraContainer, View zoomSlider, Theme.ResourcesProvider resourcesProvider) {
             this.host = host;
+            this.cameraContainer = cameraContainer;
             this.zoomSlider = zoomSlider;
             this.resourcesProvider = resourcesProvider;
             pill = new FrameLayout(host.getContext());
@@ -2015,6 +2332,46 @@ public final class Main {
             clearButton = button(R.drawable.msg_blur_off, "Do not blur faces");
             blurButton.setOnClickListener(view -> choose(true, view));
             clearButton.setOnClickListener(view -> choose(false, view));
+            updateIcons();
+        }
+
+        void updateIcons() {
+            String activePack = detectActiveIconPack();
+            if (activePack.equals(currentIconPack) && blurButton.getDrawable() != null && clearButton.getDrawable() != null) {
+                return;
+            }
+            currentIconPack = activePack;
+            Drawable onDrawable = getBlurIconDrawable(host.getContext(), activePack, true);
+            Drawable offDrawable = getBlurIconDrawable(host.getContext(), activePack, false);
+            if (onDrawable != null) {
+                blurButton.setImageDrawable(onDrawable);
+            } else {
+                blurButton.setImageResource(R.drawable.msg_photo_blur);
+            }
+            if (offDrawable != null) {
+                clearButton.setImageDrawable(offDrawable);
+            } else {
+                clearButton.setImageResource(R.drawable.msg_blur_off);
+            }
+        }
+
+        void setBlurBackground(Object factory, Object colorProvider) {
+            if (factory == null) return;
+            try {
+                Class<?> cpType = Class.forName(
+                        "org.telegram.ui.Components.blur3.drawable.color.BlurredBackgroundColorProvider",
+                        false, Main.class.getClassLoader());
+                Method createMethod = factory.getClass().getMethod("create", View.class, cpType);
+                Drawable drawable = (Drawable) createMethod.invoke(factory, pill, colorProvider);
+                if (drawable != null) {
+                    Method setRadius = drawable.getClass().getMethod("setRadius", float.class);
+                    setRadius.invoke(drawable, (float) AndroidUtilities.dp(24));
+                    blurBackgroundDrawable = drawable;
+                    pill.setBackground(drawable);
+                }
+            } catch (Throwable error) {
+                emit("BlurControl setBlurBackground failed", error);
+            }
         }
 
         private ImageView button(int icon, String description) {
@@ -2032,6 +2389,7 @@ public final class Main {
         void attach() {
             if (pill.getParent() != null) return;
             applyTheme();
+            updateIcons();
             FrameLayout.LayoutParams selectorParams = new FrameLayout.LayoutParams(
                     AndroidUtilities.dp(44), AndroidUtilities.dp(44), Gravity.TOP | Gravity.LEFT);
             selectorParams.leftMargin = AndroidUtilities.dp(2);
@@ -2060,12 +2418,30 @@ public final class Main {
 
         void updatePosition() {
             if (pill.getParent() != host) return;
-            // The zoom view reserves 16 dp below its visible 48 dp pill.
-            float top = zoomSlider.getY() + zoomSlider.getHeight() - AndroidUtilities.dp(8);
+            float cameraBottom;
+            if (cameraContainer != null && cameraContainer.getHeight() > 0) {
+                cameraBottom = cameraContainer.getY() + cameraContainer.getHeight();
+            } else {
+                cameraBottom = host.getHeight() / 2f + AndroidUtilities.dp(135);
+            }
+            float top;
+            boolean zoomVisible = zoomSlider != null && zoomSlider.getVisibility() == View.VISIBLE
+                    && zoomSlider.getAlpha() > 0.05f && zoomSlider.getHeight() > 0;
+            if (zoomVisible) {
+                // The zoom view reserves 16 dp below its visible 48 dp pill.
+                // Visible zoom pill bottom is at: zoomSlider.getY() + zoomSlider.getHeight() - 16 dp.
+                // We place the blur control pill 8 dp below the visible zoom pill:
+                top = zoomSlider.getY() + zoomSlider.getHeight() - AndroidUtilities.dp(8);
+            } else {
+                // When zoom slider is hidden (front camera / no zoom), place the blur pill
+                // at the standard 16 dp offset directly below the camera circle.
+                top = cameraBottom + AndroidUtilities.dp(16);
+            }
             float maximum = Math.max(0, host.getHeight() - pill.getHeight() - AndroidUtilities.dp(8));
             pill.setTranslationY(Math.min(top, maximum));
-            pill.setAlpha(zoomSlider.getAlpha());
-            pill.setVisibility(host.getVisibility() == View.VISIBLE ? View.VISIBLE : View.INVISIBLE);
+            float alpha = cameraContainer != null ? cameraContainer.getAlpha() : 1.0f;
+            pill.setAlpha(alpha);
+            pill.setVisibility(host.getVisibility() == View.VISIBLE && alpha > 0.01f ? View.VISIBLE : View.INVISIBLE);
         }
 
         void choose(boolean enabled, View source) {
@@ -2075,6 +2451,7 @@ public final class Main {
 
         void update() {
             applyTheme();
+            updateIcons();
             if ("DEGRADED".equals(protectionState) && blurEnabled) {
                 blurButton.setContentDescription("Face blur active (degraded)");
             } else {
@@ -2087,7 +2464,16 @@ public final class Main {
         }
 
         private void applyTheme() {
-            int panel = Theme.getColor(Theme.key_chat_messagePanelBackground, resourcesProvider);
+            if (blurBackgroundDrawable != null) {
+                try {
+                    Method updateColors = blurBackgroundDrawable.getClass().getMethod("updateColors");
+                    updateColors.invoke(blurBackgroundDrawable);
+                } catch (Throwable ignored) { }
+            } else {
+                int panel = Theme.getColor(Theme.key_chat_messagePanelBackground, resourcesProvider);
+                int semiTransparent = Theme.multAlpha(panel, 0.78f);
+                pill.setBackground(Theme.createRoundRectDrawable(AndroidUtilities.dp(24), semiTransparent));
+            }
             int selected = Theme.getColor(Theme.key_featuredStickers_addButton, resourcesProvider);
             if (blurEnabled) {
                 if ("DEGRADED".equals(protectionState)) {
@@ -2098,7 +2484,6 @@ public final class Main {
                     selected = Theme.getColor(Theme.key_featuredStickers_addButton, resourcesProvider);
                 }
             }
-            pill.setBackground(Theme.createRoundRectDrawable(AndroidUtilities.dp(24), panel));
             selector.setBackground(Theme.createRoundRectDrawable(AndroidUtilities.dp(22), selected));
         }
 

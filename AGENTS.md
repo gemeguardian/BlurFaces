@@ -1,33 +1,91 @@
-# Native ELF plugin template
+# Blur Faces v3.0.0 — Agent Instructions & Repository Guidelines
 
-This is a minimal exteraGram native plugin template for `arm64-v8a`. The C++ library does nothing except log when Android loads or unloads it. The final `.plugin` contains the compiled ELF `.so` embedded as Base64, so only one file is installed on the phone.
+This document provides instructions for agents and developers working on the `blur-faces` plugin repository.
 
-## Build
+## Project Purpose
 
-```bash
-cd /home/PluginDev/template-so
-./build-native.sh
-```
+`blur-faces` is a privacy plugin for exteraGram / Telegram Android that automatically blurs or pixelates human faces and heads in real-time camera previews and recorded round-video messages.
 
-This runs the Android NDK build and then creates `build/plugin/myplugin.plugin`.
+## Key Invariants
 
-## Install
+1. **100% Offline & Zero-Network**:
+   - The plugin must NEVER perform any network calls, socket connections, or HTTP downloads.
+   - All models (`head_det.param`, `head_det.bin`), native libraries (`libblur_faces.so`), and Dalvik bytecode (`core.dex`) must remain bundled directly inside the `.elyx` archive.
 
-Install only:
+2. **Fail-Closed Security**:
+   - If the detector or tracking state is uninitialized or in transition (e.g. during a camera switch or startup), the frame must remain covered by blur.
+   - Never show an unblurred frame if there is any chance a human face is present.
+
+3. **Sub-15ms Real-Time Performance**:
+   - Inference uses Tencent NCNN with ARM64 NEON SIMD optimizations.
+   - Frame readback uses asynchronous double-buffered OpenGL Pixel Buffer Objects (PBOs) in `CleanFrameTap.java` to prevent stalling the camera GL thread.
+
+4. **Zero Lingering Blur on Camera Flip**:
+   - Camera switch barrier is 1 frame (~12ms).
+   - Any camera flip event must immediately invoke `noteCameraSwitch()` and `CleanFrameTap.resetPbo()` to flush pending async buffers.
+
+5. **Strict False-Positive Suppression**:
+   - The C++ engine in `src/head_detector.cpp` enforces:
+     * BT.601 skin chrominance locus check ($C_r \in [129, 178]$, $C_b \in [77, 130]$).
+     * Euclidean chrominance radius $\Delta_{\text{chroma}} \ge 2.85$ (rejects pants, denim, knees, office chairs).
+     * Non-biological yellow filter ($C_b < 75$, $R > 90$, $G > 70$) (rejects ceramic mugs and yellow objects).
+     * Spatial texture energy threshold $\ge 3.20$ (rejects blank walls, flat doors, cardboard).
+     * Deactivation of Feature 2 anchors (`feature_idx < 2`) (eliminates micro-clutter false positives).
+     * Biological hemoglobin balance ratio $(R - G) / (R - B) \ge 0.58$ and canine snout contrast gating (rejects dogs and pets).
+
+## Repository Structure
 
 ```text
-build/plugin/myplugin.plugin
+/home/PluginDev/plugins/blur-faces/
+├── Android.mk / Application.mk  # NDK C++ build definition
+├── build.gradle / gradlew        # Java / DEX build configuration
+├── build.sh                      # Unified build script (NDK + Gradle + elyb)
+├── build.py                      # Asset validation, staging & hash generator
+├── HANDOFF.md                    # Architecture handoff documentation
+├── DEVICE_VALIDATION_3.0.0.md    # Physical device testing checklist
+├── src/                          # Native C++ & Java source code
+│   ├── head_detector.cpp/.h      # NCNN inference & multi-cue filters
+│   ├── bytetrack.cpp/.h          # Multi-object ByteTrack tracker
+│   ├── main.cpp                  # JNI entry points
+│   └── main/java/                # Android Java hooks & GL shaders
+│       └── com/makey/blurfaces/g2/
+│           ├── Main.java         # Camera lifecycle, hooks & shader swap
+│           ├── CleanFrameTap.java# PBO async readback & Gaussian blur
+│           └── NativeBridge.java # JNI loader bridge
+├── BlurFaces/                    # Elyx plugin bundle contents
+│   ├── metainfo.yml              # Plugin metadata
+│   ├── main.py                   # Elyx UI & settings
+│   ├── runtime.py                # Asset extraction & DexClassLoader runner
+│   ├── strings/                  # Localization (ru, en)
+│   └── assets/                   # Bundled binaries & NCNN models
+├── legacy/                       # Retired components (SCRFD, old landmarker tests)
+└── tests_*.py                    # Unit and regression test contracts
 ```
 
-The Python loader decodes the embedded `libmyplugin.so` into the app's private cache directory and calls `System.load()` on it. No separate `.so` push is required.
+## Build Environment
 
-## Files
+To build the plugin:
+```bash
+./build.sh
+```
 
-- `src/main.cpp`: native C++ entry points `JNI_OnLoad` and `JNI_OnUnload`.
-- `Android.mk`, `Application.mk`: Android NDK build configuration.
-- `build-native.sh`: builds the ELF and embeds it into the plugin.
-- `loader/`: metadata, loader, and Base64 packer.
+The script automatically detects or accepts:
+- `JAVA_HOME` (JDK 17+)
+- `ELYX_BUILDER` or `ELYB_PATH` (path to `elyb`)
+- `ANDROID_NDK_ROOT` or `NDK_PATH` (path to Android NDK)
 
-## Limitations
+The output installable artifact is generated at:
+`builds/blur_faces-3.0.0.elyx`
 
-This template targets `arm64-v8a`, which is the architecture used by modern phones such as OnePlus 13. It does not provide a Java/Xposed bridge and it does not hook Telegram. Native code that needs Java interaction must add JNI calls and obtain a `JNIEnv*` from the `JavaVM*` received in `JNI_OnLoad`.
+## Verification & Testing
+
+Before completing any changes:
+```bash
+# 1. Run Python test contracts
+python3 -m pytest tests_*.py
+python3 tests_tracking_behavior.py
+python3 tests_elyx_contract.py
+
+# 2. Build the plugin and verify hashes
+./build.sh
+```

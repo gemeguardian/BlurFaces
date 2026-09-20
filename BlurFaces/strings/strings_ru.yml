@@ -24,5 +24,3 @@ settings_range_subtext: "Выше чувствительность — прин�
 range_normal: "Обычная"
 range_extended: "Повышенная"
 range_far: "Высокая"
-settings_self_test: "Проверить защиту"
-settings_self_test_subtext: "Запускает встроенный тест приватности для проверки эффективности размытия и уничтожения черт лица"

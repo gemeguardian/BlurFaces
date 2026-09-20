@@ -38,7 +38,7 @@ float compute_iou(const HeadBox& a, const HeadBox& b) {
     return denom > 0.0f ? inter / denom : 0.0f;
 }
 
-// Fast spatial texture gradient energy check to suppress flat textureless CNN hallucinations
+// Spatial texture gradient energy check to suppress flat textureless CNN hallucinations
 inline float compute_texture_energy(const ncnn::Mat& img, const HeadBox& box) {
     int x0 = std::clamp(static_cast<int>(box.x1 * img.w), 1, img.w - 2);
     int y0 = std::clamp(static_cast<int>(box.y1 * img.h), 1, img.h - 2);
@@ -71,10 +71,92 @@ inline float compute_texture_energy(const ncnn::Mat& img, const HeadBox& box) {
     return sum_grad / (kSamples * kSamples);
 }
 
-// Fast fixed-point chrominance validation to reject achromatic macro-hallucinations (knees, pants, floors)
-bool verify_head_chrominance(const unsigned char* rgba, int img_w, int img_h,
-                             float xmin, float ymin, float xmax, float ymax,
-                             int feature_idx) {
+} // namespace
+
+namespace hdv {
+
+inline float smoothstep01(float edge0, float edge1, float x) {
+    float t = std::clamp((x - edge0) / (edge1 - edge0), 0.0f, 1.0f);
+    return t * t * (3.0f - 2.0f * t);
+}
+
+inline float logit_bias(float mean_lum, int feature_idx) {
+    float b = 1.35f * (1.0f - smoothstep01(14.0f, 65.0f, mean_lum));
+    if (feature_idx == 1) b += 0.30f; // selfie anchor prior
+    return b;
+}
+
+struct FrameContext {
+    float gw_cr = 128.0f;
+    float gw_cb = 128.0f;
+    float mean_lum = 128.0f;
+    int width = 0;
+    int height = 0;
+    float gain = 1.0f;
+};
+
+static FrameContext s_ctx;
+
+void set_gain(float gain) {
+    s_ctx.gain = std::max(1.0f, std::min(10.0f, gain));
+}
+
+float get_gain() {
+    return s_ctx.gain;
+}
+
+inline float candidate_prob_floor(int feature_idx, float mean_frame_lum) {
+    float s = smoothstep01(18.0f, 85.0f, mean_frame_lum);
+    if (feature_idx == 1) {
+        return 0.21f + 0.29f * s; // 0.21 in dark -> 0.50 in daylight
+    }
+    return 0.20f + 0.05f * s;
+}
+
+void update_frame_context(const unsigned char* rgba, int width, int height) {
+    s_ctx.width = width;
+    s_ctx.height = height;
+    if (!rgba || width <= 0 || height <= 0) return;
+
+    int step_x = std::max(1, width / 32);
+    int step_y = std::max(1, height / 32);
+    int64_t sum_lum = 0;
+    int64_t sum_cr = 0;
+    int64_t sum_cb = 0;
+    int sample_count = 0;
+
+    for (int y = 0; y < height; y += step_y) {
+        const unsigned char* row = rgba + y * width * 4;
+        for (int x = 0; x < width; x += step_x) {
+            const unsigned char* p = row + x * 4;
+            int r = p[0];
+            int g = p[1];
+            int b = p[2];
+            int lum = (p[0] * 77 + p[1] * 150 + p[2] * 29) >> 8;
+            int cb = 128 + ((-43 * r - 85 * g + 128 * b) >> 8);
+            int cr = 128 + ((128 * r - 107 * g - 21 * b) >> 8);
+
+            sum_lum += lum;
+            sum_cr += cr;
+            sum_cb += cb;
+            sample_count++;
+        }
+    }
+
+    if (sample_count > 0) {
+        s_ctx.mean_lum = static_cast<float>(sum_lum) / sample_count;
+        s_ctx.gw_cr = static_cast<float>(sum_cr) / sample_count;
+        s_ctx.gw_cb = static_cast<float>(sum_cb) / sample_count;
+    } else {
+        s_ctx.mean_lum = 128.0f;
+        s_ctx.gw_cr = 128.0f;
+        s_ctx.gw_cb = 128.0f;
+    }
+}
+
+bool verify_head_candidate(const unsigned char* rgba, int img_w, int img_h,
+                           float xmin, float ymin, float xmax, float ymax,
+                           int feature_idx) {
     int ix0 = std::clamp(static_cast<int>(xmin * img_w), 0, img_w - 1);
     int iy0 = std::clamp(static_cast<int>(ymin * img_h), 0, img_h - 1);
     int ix1 = std::clamp(static_cast<int>(xmax * img_w), 0, img_w - 1);
@@ -84,145 +166,219 @@ bool verify_head_chrominance(const unsigned char* rgba, int img_w, int img_h,
     int box_h = iy1 - iy0;
     if (box_w < 4 || box_h < 4) return true;
 
+    float cx = (ix0 + ix1) * 0.5f;
+    float cy = (iy0 + iy1) * 0.5f;
+    float rx = box_w * 0.5f;
+    float ry = box_h * 0.5f;
+
+    // 1. Local reference white point (Cr^ref, Cb^ref):
+    // Mix 24-point ring around candidate box with whole-frame gray-world white point
+    constexpr int kRingPoints = 24;
+    float ring_sum_cr = 0.0f;
+    float ring_sum_cb = 0.0f;
+    constexpr float kRingRadiusScale = 1.25f;
+    constexpr float kPi = 3.14159265358979323846f;
+
+    for (int k = 0; k < kRingPoints; ++k) {
+        float angle = (2.0f * kPi * k) / static_cast<float>(kRingPoints);
+        int px = std::clamp(static_cast<int>(cx + rx * kRingRadiusScale * std::cos(angle)), 0, img_w - 1);
+        int py = std::clamp(static_cast<int>(cy + ry * kRingRadiusScale * std::sin(angle)), 0, img_h - 1);
+        const unsigned char* p = rgba + (py * img_w + px) * 4;
+        int r = p[0];
+        int g = p[1];
+        int b = p[2];
+        float cb = 128.0f + ((-43.0f * r - 85.0f * g + 128.0f * b) / 256.0f);
+        float cr = 128.0f + ((128.0f * r - 107.0f * g - 21.0f * b) / 256.0f);
+        ring_sum_cr += cr;
+        ring_sum_cb += cb;
+    }
+    float ring_cr = ring_sum_cr / kRingPoints;
+    float ring_cb = ring_sum_cb / kRingPoints;
+
+    float cr_ref = 0.5f * ring_cr + 0.5f * s_ctx.gw_cr;
+    float cb_ref = 0.5f * ring_cb + 0.5f * s_ctx.gw_cb;
+
+    // 2. Central 72% ROI inside candidate box
+    float roi_x0 = ix0 + 0.14f * box_w;
+    float roi_x1 = ix1 - 0.14f * box_w;
+    float roi_y0 = iy0 + 0.14f * box_h;
+    float roi_y1 = iy1 - 0.14f * box_h;
+
+    // 3. 8x8 grid with 2x2 box filtering
     constexpr int kGrid = 8;
-    float step_x = static_cast<float>(box_w) / (kGrid + 1);
-    float step_y = static_cast<float>(box_h) / (kGrid + 1);
+    float Y[kGrid][kGrid];
+    float Cr[kGrid][kGrid];
+    float Cb[kGrid][kGrid];
 
-    int skin_hits = 0;
-    int center_skin_hits = 0;
-    int top_skin_hits = 0;
+    float sum_y = 0.0f;
+    float sum_cr = 0.0f;
+    float sum_cb = 0.0f;
+    float min_y = 255.0f;
+    float max_y = 0.0f;
     int yellow_hits = 0;
-    int sum_cb = 0;
-    int sum_cr = 0;
-    int sum_r = 0;
-    int sum_g = 0;
-    int sum_b = 0;
-    int sum_lum = 0;
-    int center_sum_lum = 0;
-    int min_lum = 255;
-    int max_lum = 0;
-    constexpr int total_samples = kGrid * kGrid;
 
-    for (int j = 1; j <= kGrid; ++j) {
-        int y = iy0 + static_cast<int>(j * step_y);
-        const unsigned char* row = rgba + y * img_w * 4;
-        for (int i = 1; i <= kGrid; ++i) {
-            int x = ix0 + static_cast<int>(i * step_x);
-            const unsigned char* p = row + x * 4;
-            int r = p[0];
-            int g = p[1];
-            int b = p[2];
+    for (int j = 0; j < kGrid; ++j) {
+        float fy = roi_y0 + ((j + 0.5f) / kGrid) * (roi_y1 - roi_y0);
+        int iy = std::clamp(static_cast<int>(fy), 0, img_h - 2);
+        for (int i = 0; i < kGrid; ++i) {
+            float fx = roi_x0 + ((i + 0.5f) / kGrid) * (roi_x1 - roi_x0);
+            int ix = std::clamp(static_cast<int>(fx), 0, img_w - 2);
 
-            int lum = (r * 77 + g * 150 + b * 29) >> 8;
-            if (lum < min_lum) min_lum = lum;
-            if (lum > max_lum) max_lum = lum;
-            sum_lum += lum;
+            // 2x2 box filter
+            const unsigned char* p00 = rgba + (iy * img_w + ix) * 4;
+            const unsigned char* p10 = rgba + (iy * img_w + (ix + 1)) * 4;
+            const unsigned char* p01 = rgba + ((iy + 1) * img_w + ix) * 4;
+            const unsigned char* p11 = rgba + ((iy + 1) * img_w + (ix + 1)) * 4;
 
-            if (j >= 3 && j <= 6 && i >= 3 && i <= 6) {
-                center_sum_lum += lum;
-            }
+            float r = (p00[0] + p10[0] + p01[0] + p11[0]) * 0.25f;
+            float g = (p00[1] + p10[1] + p01[1] + p11[1]) * 0.25f;
+            float b = (p00[2] + p10[2] + p01[2] + p11[2]) * 0.25f;
 
-            // Integer fixed-point ITU-R BT.601 YCbCr conversion
-            int cb = 128 + ((-43 * r - 85 * g + 128 * b) >> 8);
-            int cr = 128 + ((128 * r - 107 * g - 21 * b) >> 8);
+            float y_val = (77.0f * r + 150.0f * g + 29.0f * b) / 256.0f;
+            float cb_val = 128.0f + ((-43.0f * r - 85.0f * g + 128.0f * b) / 256.0f);
+            float cr_val = 128.0f + ((128.0f * r - 107.0f * g - 21.0f * b) / 256.0f);
 
-            sum_cb += cb;
-            sum_cr += cr;
-            sum_r += r;
-            sum_g += g;
-            sum_b += b;
+            Y[j][i] = y_val;
+            Cr[j][i] = cr_val;
+            Cb[j][i] = cb_val;
 
-            // Artificial saturated yellow / amber (ceramics, mugs, plastic, beer)
-            // Human skin across all ethnicities physically never has Cb < 75
-            if (cb < 75 && r > 90 && g > 70) {
+            sum_y += y_val;
+            sum_cr += cr_val;
+            sum_cb += cb_val;
+
+            if (y_val < min_y) min_y = y_val;
+            if (y_val > max_y) max_y = y_val;
+
+            if (cb_val < 75.0f && r > 90.0f && g > 70.0f) {
                 yellow_hits++;
-            }
-
-            // Standard biological skin locus (Fitzpatrick I through VI)
-            // Excludes near-neutral gray/black objects (chairs, clothes, cushions)
-            if (cb >= 77 && cb <= 127 && cr >= 133 && cr <= 173 && (r > b)) {
-                skin_hits++;
-                if (j <= 3) {
-                    top_skin_hits++;
-                }
-                if (j >= 3 && j <= 6 && i >= 3 && i <= 6) {
-                    center_skin_hits++;
-                }
             }
         }
     }
 
-    // Reject objects with non-biological saturated yellow (> 7% of box)
+    constexpr int kTotal = kGrid * kGrid; // 64
+    float mu = sum_y / kTotal;
+    float cr_mean = sum_cr / kTotal;
+    float cb_mean = sum_cb / kTotal;
+
+    // Saturated non-biological yellow ceramic/mug filter
     if (yellow_hits >= 5) return false;
 
-    float skin_ratio = static_cast<float>(skin_hits) / total_samples;
-    float cb_mean = static_cast<float>(sum_cb) / total_samples;
-    float cr_mean = static_cast<float>(sum_cr) / total_samples;
-    int rb_diff = (sum_r - sum_b) / total_samples;
+    // 4. Residual chroma vector and projection onto invariant skin axis u = (+0.882, -0.471)
+    float dr = cr_mean - cr_ref;
+    float db = cb_mean - cb_ref;
+    float proj = dr * 0.882f + db * (-0.471f);
 
-    // Human skin has average Cb >= 100 (in tungsten warm light >= 92); yellow ceramics have Cb ~ 73
-    if (cb_mean < 92.0f) return false;
+    // Spatial chroma variation sigma_cr and sigma_c
+    float var_cr = 0.0f;
+    float var_cb = 0.0f;
+    float var_y = 0.0f;
+    for (int j = 0; j < kGrid; ++j) {
+        for (int i = 0; i < kGrid; ++i) {
+            float dcr = Cr[j][i] - cr_mean;
+            var_cr += dcr * dcr;
+            float dcb = Cb[j][i] - cb_mean;
+            var_cb += dcb * dcb;
+            float dy = Y[j][i] - mu;
+            var_y += dy * dy;
+        }
+    }
+    float sigma_cr = std::sqrt(var_cr / kTotal);
+    float sigma_c = std::sqrt((var_cr + var_cb) / kTotal);
+    float sigma_y = std::sqrt(var_y / kTotal);
 
-    // Euclidean chrominance radius from neutral gray (128, 128)
-    // Chair = 2.29, knees = 0.8, dark clothes < 2.5, true human heads >= 3.05
-    float d_cr = cr_mean - 128.0f;
-    float d_cb = cb_mean - 128.0f;
-    float chroma_dist = std::sqrt(d_cr * d_cr + d_cb * d_cb);
-    if (chroma_dist < 2.85f) return false;
+    // Minimum Euclidean chrominance radius from sample averaging scaled by preprocessor gain:
+    float g = s_ctx.gain;
+    float mu_raw = (g > 1.05f) ? (mu / g) : mu;
+    float dmin = g * std::max(0.45f, 0.38f + 0.0195f * mu_raw) + (1.8f * (sigma_c * g) / 8.0f);
 
-    // Real human heads have contiguous facial skin across the central core (cheeks, nose, mouth).
-    // In human selfie video notes, center_skin_hits is >= 8 out of 16 (dataset min 9, mean 15.75).
-    // Dog body/torso/rump false positives have dark steel/black saddle or fur boundaries in center (< 8 hits).
-    if (center_skin_hits < 8) return false;
+    // 5. Weber-normalized 3D facial relief metrics:
+    // a) Laplacian energy lap (Lambda)
+    float sum_lap = 0.0f;
+    for (int j = 1; j <= 6; ++j) {
+        for (int i = 1; i <= 6; ++i) {
+            float lap_val = Y[j - 1][i] + Y[j + 1][i] + Y[j][i - 1] + Y[j][i + 1] - 4.0f * Y[j][i];
+            sum_lap += std::abs(lap_val);
+        }
+    }
+    float lap = sum_lap / (36.0f * (mu + 1.0f));
 
-    // Top skin check: human head upper quadrant contains forehead skin (dataset min 2, mean 20.0).
-    // Dog nose tips and dark pet backs contain zero skin locus hits in the upper 3 rows (< 2 hits).
-    if (top_skin_hits < 2) return false;
+    // b) Weber dynamic range Cw
+    float Cw = (max_y - min_y) / (mu + 1.0f);
 
-    float box_lum_mean = static_cast<float>(sum_lum) / total_samples;
-    float center_lum_mean = static_cast<float>(center_sum_lum) / 16.0f;
+    // c) Weber variance nu
+    float nu = sigma_y / (mu + 1.0f);
 
-    // Canine dark-snout vs illuminated human facial core check:
-    // A human facial core is prominently illuminated (center_lum_mean / box_lum_mean >= 0.66).
-    // When a pet dog looks up surrounded by bright beige floor tiles, the center is a dark snout (< 55% of box mean).
-    if (box_lum_mean > 45.0f && (center_lum_mean / box_lum_mean) < 0.55f) {
+    // d) T-zone profile T: forehead (rows 1-2, cols 2-5) + nose (rows 3-5, cols 3-4) vs lateral cheeks
+    float sum_tzone = 0.0f;
+    int count_tzone = 0;
+    for (int j = 1; j <= 2; ++j) {
+        for (int i = 2; i <= 5; ++i) {
+            sum_tzone += Y[j][i];
+            count_tzone++;
+        }
+    }
+    for (int j = 3; j <= 5; ++j) {
+        for (int i = 3; i <= 4; ++i) {
+            sum_tzone += Y[j][i];
+            count_tzone++;
+        }
+    }
+
+    float sum_lat = 0.0f;
+    int count_lat = 0;
+    for (int j = 3; j <= 5; ++j) {
+        for (int i = 0; i <= 2; ++i) { sum_lat += Y[j][i]; count_lat++; }
+        for (int i = 5; i <= 7; ++i) { sum_lat += Y[j][i]; count_lat++; }
+    }
+
+    float mu_tzone = sum_tzone / count_tzone;
+    float mu_lat = sum_lat / count_lat;
+    float T = (mu_tzone - mu_lat) / (mu + 1.0f);
+
+    // Explicit Vetoes:
+    // 1. Black chair rejection: near-zero skin projection and flat Laplacian energy
+    if (proj < 0.45f * dmin && lap < 0.026f) return false;
+
+    // 2. Flat dark coat / couch rejection: very low luminance and low Weber dynamic range
+    if (mu < 26.f && Cw < 0.13f) return false;
+
+    // 3. Flat uniform achromatic surface check:
+    if (sigma_cr < 0.35f && proj < 0.50f * dmin) return false;
+
+    // 4. Canine dark snout check: prominent illuminated face vs dark animal snout
+    float center_core_lum = (Y[3][3] + Y[3][4] + Y[4][3] + Y[4][4]) * 0.25f;
+    if (mu > 45.0f && (center_core_lum / mu) < 0.50f) {
         return false;
     }
 
-    // Biological hemoglobin chrominance balance:
-    // Human skin across all Fitzpatrick types physically has (R - G) / (R - B) >= 0.58 (dataset mean 0.74, min 0.63).
-    // In contrast, canine fur, wood, and neutral gray/brown objects have R close to G (rg_ratio < 0.58).
-    int rg_diff = (sum_r - sum_g) / total_samples;
-    if (rb_diff <= 0 || (rg_diff * 100) < (rb_diff * 58)) {
-        return false;
-    }
-
+    // 5. Large quadruped fur suppression
     float box_area = (xmax - xmin) * (ymax - ymin);
-
-    // Canine full-body / torso fur suppression:
-    // A gigantic box (area > 0.55) filled with apparent skin locus (ratio > 0.70)
-    // must exhibit rich biological red chrominance (Cr >= 141.0).
-    // Flat/tan canine fur spanning the whole frame has Cr ~ 136 - 139.
-    if (box_area > 0.55f && skin_ratio > 0.70f && cr_mean < 141.0f) {
+    if (box_area > 0.55f && cr_mean < 139.0f && proj < 1.2f * dmin) {
         return false;
     }
 
-    // Real close-up faces (where hair/collar is out of frame) have high skin ratio (82% - 98%).
-    // Unlike flat cardboard sheets or wood veneer, real faces contain high-contrast facial
-    // micro-structures (eyes, pupils, nostrils, mouth fissure) with luminance variation.
-    if (skin_ratio > 0.82f && box_area > 0.08f) {
-        if ((max_lum - min_lum) < 22) return false;
-    }
+    // Soft Evidence Score Fusion:
+    float s_chroma = smoothstep01(0.20f * dmin, 1.80f * dmin, proj);
+    float s_sigma = smoothstep01(0.35f, 1.10f, sigma_cr);
+    float s_lap = smoothstep01(0.022f, 0.060f, lap);
+    float s_cw = smoothstep01(0.12f, 0.38f, Cw);
+    float s_t = std::clamp(T / 0.08f, 0.0f, 1.0f) * 0.5f + smoothstep01(0.05f, 0.25f, nu) * 0.5f;
 
-    if (feature_idx == 0) {
-        if (skin_ratio < 0.18f || cr_mean < 130.5f || rb_diff < 1) return false;
-    } else if (feature_idx == 1) {
-        if (skin_ratio < 0.18f || cr_mean < 130.9f || rb_diff < 1) return false;
-    } else {
-        if (skin_ratio < 0.22f || cr_mean < 131.0f || rb_diff < 1) return false;
-    }
+    float S = 0.28f * s_chroma + 0.18f * s_sigma + 0.26f * s_lap + 0.18f * s_cw + 0.10f * s_t;
+
+    if (S < 0.32f) return false;
 
     return true;
+}
+
+} // namespace hdv
+
+namespace {
+
+bool verify_head_chrominance(const unsigned char* rgba, int img_w, int img_h,
+                             float xmin, float ymin, float xmax, float ymax,
+                             int feature_idx) {
+    return hdv::verify_head_candidate(rgba, img_w, img_h, xmin, ymin, xmax, ymax, feature_idx);
 }
 
 void nms(std::vector<HeadBox>& candidates, std::vector<HeadBox>& picked, float threshold) {
@@ -293,25 +449,18 @@ int HeadDetector::detect(const unsigned char* rgba_pixels, int width, int height
         return -1;
     }
 
-    // RGBA to RGB (MXNet Gluon head detector was trained on RGB) and bilinear resize to 320x320
-    ncnn::Mat input = ncnn::Mat::from_pixels_resize(rgba_pixels, ncnn::Mat::PIXEL_RGBA2RGB,
-                                                    width, height, kInputW, kInputH);
+    // Update frame-level context (32x32 subsampled luminance and gray-world white point)
+    hdv::update_frame_context(rgba_pixels, width, height);
+    float mean_lum = hdv::s_ctx.mean_lum;
 
-    // Fast adaptive low-light enhancement:
-    // Sample frame luminance across a 32x32 grid (1024 samples ~ 0.05 us)
-    int step_x = std::max(1, width / 32);
-    int step_y = std::max(1, height / 32);
-    int sum_lum = 0;
-    int sample_count = 0;
-    for (int y = 0; y < height; y += step_y) {
-        const unsigned char* row = rgba_pixels + y * width * 4;
-        for (int x = 0; x < width; x += step_x) {
-            const unsigned char* p = row + x * 4;
-            sum_lum += (p[0] * 77 + p[1] * 150 + p[2] * 29) >> 8;
-            sample_count++;
-        }
+    // RGBA to RGB (MXNet Gluon head detector was trained on RGB) and bilinear resize to 320x320
+    ncnn::Mat input;
+    if (width == kInputW && height == kInputH) {
+        input = ncnn::Mat::from_pixels(rgba_pixels, ncnn::Mat::PIXEL_RGBA2RGB, kInputW, kInputH);
+    } else {
+        input = ncnn::Mat::from_pixels_resize(rgba_pixels, ncnn::Mat::PIXEL_RGBA2RGB,
+                                              width, height, kInputW, kInputH);
     }
-    float mean_lum = (sample_count > 0) ? (static_cast<float>(sum_lum) / sample_count) : 128.0f;
 
     // If scene is in low light / darkness (< 65 luma), apply gentle adaptive gamma tone mapping
     // to boost facial gradient signals for the CNN without amplifying raw sensor noise.
@@ -382,17 +531,19 @@ int HeadDetector::detect(const unsigned char* rgba_pixels, int width, int height
             for (int h = 0; h < out.h; ++h) {
                 for (int w = 0; w < out.w; ++w) {
                     float box_score = *score_ptr;
-                    if (box_score > score_threshold_logit) {
+                    float bias = hdv::logit_bias(mean_lum, feature_idx);
+                    float adj_score = box_score + bias;
+                    if (box_score > score_threshold_logit || adj_score > score_threshold_logit) {
                         float bbox_cx = (w + *xptr) / static_cast<float>(out.w);
                         float bbox_cy = (h + *yptr) / static_cast<float>(out.h);
                         float bbox_w = std::exp(*wptr) * bias_w / static_cast<float>(kInputW);
                         float bbox_h = std::exp(*hptr) * bias_h / static_cast<float>(kInputH);
 
-                        float prob = sigmoid(box_score);
+                        float prob = sigmoid(adj_score);
 
-                        // Medium-scale F1 A1 anchor (96x120): true human heads in this scale always exhibit
-                        // sharp confidence >= 0.66 (mean 0.98). Suppress ambiguous pet/fur proposals (< 0.50).
-                        if (feature_idx == 1 && anchor_idx == 1 && prob < 0.50f) {
+                        // Dynamic candidate probability floor:
+                        // For selfie anchor F1#1 (and F0/F1), replace hard prob < 0.50f with candidate_prob_floor
+                        if (feature_idx == 1 && anchor_idx == 1 && prob < hdv::candidate_prob_floor(feature_idx, mean_lum)) {
                             xptr++; yptr++; wptr++; hptr++; score_ptr++;
                             continue;
                         }
@@ -432,7 +583,7 @@ int HeadDetector::detect(const unsigned char* rgba_pixels, int width, int height
                                 continue;
                             }
                             if (aspect >= 0.45f && aspect <= 1.60f) {
-                                if (!verify_head_chrominance(rgba_pixels, width, height, xmin, ymin, xmax, ymax, feature_idx)) {
+                                if (!hdv::verify_head_candidate(rgba_pixels, width, height, xmin, ymin, xmax, ymax, feature_idx)) {
                                     xptr++; yptr++; wptr++; hptr++; score_ptr++;
                                     continue;
                                 }
@@ -452,7 +603,7 @@ int HeadDetector::detect(const unsigned char* rgba_pixels, int width, int height
                                 // true head texture energy is >= 4.20 even in dark rooms (mean 14.80).
                                 // Flat doors and planar surfaces have texture energy <= 2.88.
                                 float tex_energy = compute_texture_energy(input, box);
-                                float min_tex = (feature_idx == 0) ? 3.5f : 2.8f;
+                                float min_tex = (mean_lum < 65.0f) ? (mean_lum < 40.0f ? 1.0f : 1.8f) : ((feature_idx == 0) ? 3.2f : 2.5f);
                                 if (tex_energy < min_tex) {
                                     xptr++; yptr++; wptr++; hptr++; score_ptr++;
                                     continue;
