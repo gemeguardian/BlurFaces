@@ -207,8 +207,8 @@ HeadBox STrack::current_box() const {
 
 void STrack::get_geometry(float* out6) const {
     HeadBox box = current_box();
-    float halfWidth = box.w * 0.55f;
-    float halfHeight = box.h * 0.62f;
+    float halfWidth = box.w * 0.58f;
+    float halfHeight = box.h * 0.65f;
 
     out6[0] = box.cx;
     out6[1] = box.cy;

@@ -23,133 +23,6 @@ float compute_iou(const HeadBox& a, const HeadBox& b) {
     return denom > 0.0f ? inter / denom : 0.0f;
 }
 
-// Fast spatial texture gradient energy check to suppress flat textureless CNN hallucinations
-inline float compute_texture_energy(const ncnn::Mat& img, const HeadBox& box) {
-    int x0 = std::clamp(static_cast<int>(box.x1 * img.w), 1, img.w - 2);
-    int y0 = std::clamp(static_cast<int>(box.y1 * img.h), 1, img.h - 2);
-    int x1 = std::clamp(static_cast<int>(box.x2 * img.w), 1, img.w - 2);
-    int y1 = std::clamp(static_cast<int>(box.y2 * img.h), 1, img.h - 2);
-
-    if (x1 <= x0 + 4 || y1 <= y0 + 4) return 20.0f; // too small to sample reliably, pass through
-
-    const float* g_ptr = img.channel(1); // green channel represents primary luminance signal
-    int stride = img.w;
-
-    // 8x8 grid = 64 interior points
-    constexpr int kSamples = 8;
-    float step_x = static_cast<float>(x1 - x0) / (kSamples + 1);
-    float step_y = static_cast<float>(y1 - y0) / (kSamples + 1);
-
-    float sum_grad = 0.0f;
-    for (int j = 1; j <= kSamples; ++j) {
-        int y = y0 + static_cast<int>(j * step_y);
-        const float* row = g_ptr + y * stride;
-        const float* row_above = g_ptr + (y - 1) * stride;
-        const float* row_below = g_ptr + (y + 1) * stride;
-        for (int i = 1; i <= kSamples; ++i) {
-            int x = x0 + static_cast<int>(i * step_x);
-            // Multiplied by 255 because img channel is normalized [0, 1]
-            float gx = std::abs(row[x + 1] - row[x - 1]) * 255.0f;
-            float gy = std::abs(row_below[x] - row_above[x]) * 255.0f;
-            sum_grad += (gx + gy);
-        }
-    }
-    return sum_grad / (kSamples * kSamples);
-}
-
-// Lightweight candidate validation:
-// High-confidence proposals (prob >= 0.55f) from YOLOv8n (trained on HollywoodHeads and DAD-3DHeads)
-// are verified anatomically by the 3M-parameter network across all 360° yaw/pitch angles.
-// For borderline proposals (prob < 0.55f), we enforce biological hemoglobin chrominance and
-// canine snout contrast checks to reject furniture, floor patterns, and pets.
-bool verify_head_candidate(const unsigned char* rgba, int img_w, int img_h,
-                           float xmin, float ymin, float xmax, float ymax,
-                           float prob) {
-    int ix0 = std::clamp(static_cast<int>(xmin * img_w), 0, img_w - 1);
-    int iy0 = std::clamp(static_cast<int>(ymin * img_h), 0, img_h - 1);
-    int ix1 = std::clamp(static_cast<int>(xmax * img_w), 0, img_w - 1);
-    int iy1 = std::clamp(static_cast<int>(ymax * img_h), 0, img_h - 1);
-
-    int box_w = ix1 - ix0;
-    int box_h = iy1 - iy0;
-    if (box_w < 4 || box_h < 4) return true;
-
-    constexpr int kGrid = 8;
-    float step_x = static_cast<float>(box_w) / (kGrid + 1);
-    float step_y = static_cast<float>(box_h) / (kGrid + 1);
-
-    int sum_cb = 0;
-    int sum_cr = 0;
-    int sum_r = 0;
-    int sum_g = 0;
-    int sum_b = 0;
-    int sum_lum = 0;
-    int center_sum_lum = 0;
-    constexpr int total_samples = kGrid * kGrid;
-
-    for (int j = 1; j <= kGrid; ++j) {
-        int y = iy0 + static_cast<int>(j * step_y);
-        const unsigned char* row = rgba + y * img_w * 4;
-        for (int i = 1; i <= kGrid; ++i) {
-            int x = ix0 + static_cast<int>(i * step_x);
-            const unsigned char* p = row + x * 4;
-            int r = p[0];
-            int g = p[1];
-            int b = p[2];
-
-            int lum = (r * 77 + g * 150 + b * 29) >> 8;
-            sum_lum += lum;
-
-            if (j >= 3 && j <= 6 && i >= 3 && i <= 6) {
-                center_sum_lum += lum;
-            }
-
-            // Integer fixed-point ITU-R BT.601 YCbCr conversion
-            int cb = 128 + ((-43 * r - 85 * g + 128 * b) >> 8);
-            int cr = 128 + ((128 * r - 107 * g - 21 * b) >> 8);
-
-            sum_cb += cb;
-            sum_cr += cr;
-            sum_r += r;
-            sum_g += g;
-            sum_b += b;
-        }
-    }
-
-    float box_lum_mean = static_cast<float>(sum_lum) / total_samples;
-    float center_lum_mean = static_cast<float>(center_sum_lum) / 16.0f;
-
-    // Canine dark-snout check:
-    // When a pet looks toward the camera against lighter backgrounds, the center snout is
-    // significantly darker than the box average (< 52% of box mean).
-    if (box_lum_mean > 45.0f && (center_lum_mean / box_lum_mean) < 0.52f) {
-        return false;
-    }
-
-    // High confidence YOLOv8 detections (>= 0.55f) retain full 360° coverage (hair, back of head, hood).
-    if (prob >= 0.55f) {
-        return true;
-    }
-
-    // Borderline proposals (< 0.55f) must satisfy biological hemoglobin and chroma distance:
-    int rb_diff = (sum_r - sum_b) / total_samples;
-    int rg_diff = (sum_r - sum_g) / total_samples;
-
-    // Biological hemoglobin chrominance balance: (R - G) / (R - B) >= 0.58
-    if (rb_diff <= 0 || (rg_diff * 100) < (rb_diff * 58)) {
-        return false;
-    }
-
-    float cb_mean = static_cast<float>(sum_cb) / total_samples;
-    float cr_mean = static_cast<float>(sum_cr) / total_samples;
-    float d_cr = cr_mean - 128.0f;
-    float d_cb = cb_mean - 128.0f;
-    float chroma_dist = std::sqrt(d_cr * d_cr + d_cb * d_cb);
-    if (chroma_dist < 2.5f) return false;
-
-    return true;
-}
-
 void nms(std::vector<HeadBox>& candidates, std::vector<HeadBox>& picked, float threshold) {
     picked.clear();
     std::sort(candidates.begin(), candidates.end(), [](const HeadBox& a, const HeadBox& b) {
@@ -310,25 +183,21 @@ int HeadDetector::detect(const unsigned char* rgba_pixels, int width, int height
         float bh = ymax - ymin;
 
         // Circular mask upper sensor boundary clip:
-        // Boxes touching extreme top border (ymin <= 0.01) with small height (bh <= 0.25)
+        // Boxes touching extreme top border (ymin <= 0.005) with small height (bh <= 0.15)
         // correspond to sensor clipping artifacts or fingers on phone edge.
-        if (ymin <= 0.01f && bh <= 0.25f) continue;
+        if (ymin <= 0.005f && bh <= 0.15f) continue;
 
-        // Physical bounding box sanity checks for human head in round video notes:
-        // - Min: 7% width, 8% height (rejects buttons, specks, tags)
+        // Physical bounding box sanity checks:
+        // - Min: 5% width, 5% height (rejects tiny noise artifacts)
         // - Max: 100% width, 100% height (supports full-frame close-up selfies)
-        if (bw < 0.07f || bh < 0.08f || bw > 1.0f || bh > 1.0f) continue;
+        if (bw < 0.05f || bh < 0.05f || bw > 1.0f || bh > 1.0f) continue;
 
         // Small clutter discrimination
         if ((bw < 0.11f || bh < 0.13f) && prob < 0.38f) continue;
 
+        // Aspect ratio [0.35, 2.50] supports all head tilts, profile turns, and full 360° poses
         float aspect = bw / bh;
-        // Aspect ratio [0.35, 2.0] supports extreme head tilts and profile turns
-        if (aspect < 0.35f || aspect > 2.0f) continue;
-
-        if (!verify_head_candidate(rgba_pixels, width, height, xmin, ymin, xmax, ymax, prob)) {
-            continue;
-        }
+        if (aspect < 0.35f || aspect > 2.50f) continue;
 
         HeadBox box;
         box.x1 = xmin;
@@ -340,12 +209,6 @@ int HeadDetector::detect(const unsigned char* rgba_pixels, int width, int height
         box.w = bw;
         box.h = bh;
         box.score = prob;
-
-        // On borderline proposals, ensure minimal spatial texture energy to suppress flat surfaces
-        if (prob < 0.55f) {
-            float tex_energy = compute_texture_energy(input, box);
-            if (tex_energy < 2.5f) continue;
-        }
 
         candidates.push_back(box);
     }

@@ -33,8 +33,8 @@ class LowLightAdaptiveContract(unittest.TestCase):
         self.assertIn("max_time_lost_ : 4", BYTE_CPP)
 
     def test_main_calibrates_instant_and_low_thresholds(self):
-        self.assertIn("low_thresh = std::max(0.18f, high_thresh * 0.65f)", MAIN_CPP)
-        self.assertIn("instant_thresh = std::max(0.60f, std::min(0.85f, high_thresh + 0.25f))", MAIN_CPP)
+        self.assertIn("low_thresh = std::max(0.15f, high_thresh * 0.60f)", MAIN_CPP)
+        self.assertIn("instant_thresh = std::max(0.40f, std::min(0.70f, high_thresh + 0.15f))", MAIN_CPP)
 
 
 if __name__ == "__main__":

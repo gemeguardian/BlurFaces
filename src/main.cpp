@@ -98,21 +98,21 @@ Java_com_makey_blurfaces_g2_NativeBridge_process(JNIEnv* env, jclass,
         return -1;
     }
 
-    // Map min_confidence to ByteTrack thresholds
+    // Map min_confidence to ByteTrack thresholds for YOLOv8
     float min_conf = static_cast<float>(min_confidence);
-    if (min_conf <= 0.0f) min_conf = 0.45f;
+    if (min_conf <= 0.0f) min_conf = 0.35f;
     if (min_conf > 1.0f) min_conf /= 100.0f;
 
     // high_thresh: threshold for high-confidence detections
     // low_thresh: floor for ByteTrack stage 2 matching
-    // instant_thresh: threshold for single-frame instant activation (prevent false single-frame bursts)
-    float high_thresh = std::max(0.20f, std::min(0.70f, min_conf));
-    float low_thresh = std::max(0.18f, high_thresh * 0.65f);
-    float instant_thresh = std::max(0.60f, std::min(0.85f, high_thresh + 0.25f));
+    // instant_thresh: threshold for single-frame instant activation
+    float high_thresh = std::max(0.20f, std::min(0.60f, min_conf));
+    float low_thresh = std::max(0.15f, high_thresh * 0.60f);
+    float instant_thresh = std::max(0.40f, std::min(0.70f, high_thresh + 0.15f));
 
     // Run NCNN Head Detection with low_thresh as detection floor
     std::vector<HeadBox> detected_heads;
-    g_detector->detect(pixels, width, height, detected_heads, low_thresh, 0.40f);
+    g_detector->detect(pixels, width, height, detected_heads, low_thresh, 0.45f);
 
     // Update ByteTrack multi-object tracker (returns only confirmed active tracks)
     std::vector<STrack> active_tracks = g_tracker->update(detected_heads, high_thresh, low_thresh, instant_thresh);

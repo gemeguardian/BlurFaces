@@ -329,7 +329,7 @@ def runtime_restart_reason():
 
 class DexRuntime:
     def __init__(self, plugin, round_video_width=0, face_mask_scale=100,
-                 detection_confidence=45, blur_by_default=True):
+                 detection_confidence=35, blur_by_default=True):
         self.plugin = plugin
         self.round_video_width = round_video_width
         self.face_mask_scale = face_mask_scale
