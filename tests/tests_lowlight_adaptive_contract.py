@@ -23,8 +23,8 @@ class LowLightAdaptiveContract(unittest.TestCase):
         self.assertIn("ema_lut_", HEAD_CPP)
 
     def test_head_detector_has_small_clutter_discrimination(self):
-        self.assertIn("bw < 0.12f || bh < 0.14f", HEAD_CPP)
-        self.assertIn("prob < 0.45f", HEAD_CPP)
+        self.assertIn("bw < 0.11f || bh < 0.13f", HEAD_CPP)
+        self.assertIn("prob < 0.38f", HEAD_CPP)
 
     def test_head_detector_uses_anchor_free_yolov8_decoder(self):
         self.assertIn('ex.extract("out0", out)', HEAD_CPP)
