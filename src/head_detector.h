@@ -30,12 +30,19 @@ public:
     void clear();
 
 private:
+    void enhance_lowlight(ncnn::Mat& in, float t);
+
     ncnn::Net net_;
     bool initialized_ = false;
     static constexpr int kInputW = 320;
     static constexpr int kInputH = 320;
+    static constexpr int kTilesX = 8;
+    static constexpr int kTilesY = 8;
+    static constexpr int kBins = 64;
+
+    float ema_lut_[kTilesY][kTilesX][kBins];
+    bool ema_init_ = false;
     std::vector<float> y_buf_;
-    std::vector<float> y_bal_buf_;
 };
 
 #endif // HEAD_DETECTOR_H

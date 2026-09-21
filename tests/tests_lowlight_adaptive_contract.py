@@ -16,10 +16,11 @@ class LowLightAdaptiveContract(unittest.TestCase):
 
     def test_head_detector_has_adaptive_gamma_lut(self):
         self.assertIn("mean_lum < 65.0f", HEAD_CPP)
-        self.assertIn("lut[256]", HEAD_CPP)
-        self.assertIn("float kr = std::clamp", HEAD_CPP)
-        self.assertIn("float kg = std::clamp", HEAD_CPP)
-        self.assertIn("float kb = std::clamp", HEAD_CPP)
+        self.assertIn("enhance_lowlight", HEAD_CPP)
+        self.assertIn("kTilesX", HEAD_CPP)
+        self.assertIn("kTilesY", HEAD_CPP)
+        self.assertIn("clip", HEAD_CPP)
+        self.assertIn("ema_lut_", HEAD_CPP)
 
     def test_head_detector_has_small_clutter_discrimination(self):
         self.assertIn("bw < 0.11f || bh < 0.13f", HEAD_CPP)

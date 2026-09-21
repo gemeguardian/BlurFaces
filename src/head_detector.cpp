@@ -50,7 +50,9 @@ void nms(std::vector<HeadBox>& candidates, std::vector<HeadBox>& picked, float t
 } // namespace
 
 HeadDetector::HeadDetector()
-    : initialized_(false), y_buf_(kInputW * kInputH, 0.0f), y_bal_buf_(kInputW * kInputH, 0.0f) {}
+    : initialized_(false), ema_init_(false), y_buf_(kInputW * kInputH, 0.0f) {
+    memset(ema_lut_, 0, sizeof(ema_lut_));
+}
 
 HeadDetector::~HeadDetector() {
     clear();
@@ -59,6 +61,94 @@ HeadDetector::~HeadDetector() {
 void HeadDetector::clear() {
     net_.clear();
     initialized_ = false;
+    ema_init_ = false;
+    memset(ema_lut_, 0, sizeof(ema_lut_));
+}
+
+void HeadDetector::enhance_lowlight(ncnn::Mat& in, float t) {
+    // t in (0,1] — сила эффекта, из mean_lum
+    float* R = in.channel(0);
+    float* G = in.channel(1);
+    float* B = in.channel(2);
+    const int W = kInputW, H = kInputH;
+
+    if (y_buf_.size() < static_cast<size_t>(W * H)) {
+        y_buf_.resize(W * H);
+    }
+    float* Y = y_buf_.data();
+
+    int hist[kTilesY][kTilesX][kBins];
+    memset(hist, 0, sizeof(hist));
+
+    const int tw = W / kTilesX, th = H / kTilesY;
+
+    for (int y = 0; y < H; ++y) {
+        int ty = std::min(y / th, kTilesY - 1);
+        for (int x = 0; x < W; ++x) {
+            int i = y * W + x;
+            float yy = 0.299f * R[i] + 0.587f * G[i] + 0.114f * B[i];
+            Y[i] = yy;
+            int b = std::clamp(static_cast<int>(yy * (kBins / 256.0f)), 0, kBins - 1);
+            hist[ty][std::min(x / tw, kTilesX - 1)][b]++;
+        }
+    }
+
+    // clipped CDF -> mapping, + временной EMA
+    const int pixels_per_tile = tw * th;
+    const float clip = 3.0f * pixels_per_tile / kBins;  // clip limit 3.0
+    float map_[kTilesY][kTilesX][kBins];
+
+    for (int ty = 0; ty < kTilesY; ++ty) {
+        for (int tx = 0; tx < kTilesX; ++tx) {
+            float h[kBins];
+            float excess = 0.0f;
+            for (int b = 0; b < kBins; ++b) {
+                h[b] = static_cast<float>(hist[ty][tx][b]);
+                if (h[b] > clip) {
+                    excess += h[b] - clip;
+                    h[b] = clip;
+                }
+            }
+            float add = excess / kBins;
+            float cum = 0.0f, total = static_cast<float>(pixels_per_tile);
+            for (int b = 0; b < kBins; ++b) {
+                cum += h[b] + add;
+                float eq  = 255.0f * cum / total;                 // эквализованное
+                float idn = (b + 0.5f) * (256.0f / kBins);        // исходное
+                float v   = (1.0f - t) * idn + t * eq;            // сила эффекта
+                map_[ty][tx][b] = ema_init_
+                    ? 0.7f * ema_lut_[ty][tx][b] + 0.3f * v       // антимигание
+                    : v;
+                ema_lut_[ty][tx][b] = map_[ty][tx][b];
+            }
+        }
+    }
+    ema_init_ = true;
+
+    // билинейная интерполяция между тайлами + перенос гейна на RGB
+    for (int y = 0; y < H; ++y) {
+        float fy = (y + 0.5f) / th - 0.5f;
+        int y0 = std::clamp(static_cast<int>(std::floor(fy)), 0, kTilesY - 1);
+        int y1 = std::min(y0 + 1, kTilesY - 1);
+        float wy = std::clamp(fy - y0, 0.0f, 1.0f);
+        for (int x = 0; x < W; ++x) {
+            float fx = (x + 0.5f) / tw - 0.5f;
+            int x0 = std::clamp(static_cast<int>(std::floor(fx)), 0, kTilesX - 1);
+            int x1 = std::min(x0 + 1, kTilesX - 1);
+            float wx = std::clamp(fx - x0, 0.0f, 1.0f);
+
+            int i = y * W + x;
+            int b = std::clamp(static_cast<int>(Y[i] * (kBins / 256.0f)), 0, kBins - 1);
+
+            float v = (1.0f - wy) * ((1.0f - wx) * map_[y0][x0][b] + wx * map_[y0][x1][b])
+                    +         wy  * ((1.0f - wx) * map_[y1][x0][b] + wx * map_[y1][x1][b]);
+
+            float gain = std::clamp((v + 1.0f) / (Y[i] + 1.0f), 1.0f, 4.0f);
+            R[i] = std::min(R[i] * gain, 255.0f);
+            G[i] = std::min(G[i] * gain, 255.0f);
+            B[i] = std::min(B[i] * gain, 255.0f);
+        }
+    }
 }
 
 int HeadDetector::load(const char* param_path, const char* bin_path) {
@@ -101,14 +191,11 @@ int HeadDetector::detect(const unsigned char* rgba_pixels, int width, int height
                                                     width, height, kInputW, kInputH);
 
     // Fast adaptive low-light enhancement:
-    // Sample frame luminance and shadow chrominance across a 32x32 grid (1024 samples ~ 0.05 us)
+    // Sample frame luminance across a 32x32 grid (1024 samples ~ 0.05 us)
     int step_x = std::max(1, width / 32);
     int step_y = std::max(1, height / 32);
     int sum_lum = 0;
     int sample_count = 0;
-    float sum_r = 0.0f, sum_g = 0.0f, sum_b = 0.0f;
-    int shadow_samples = 0;
-    int hist[256] = {0};
 
     for (int y = 0; y < height; y += step_y) {
         const unsigned char* row = rgba_pixels + y * width * 4;
@@ -117,117 +204,14 @@ int HeadDetector::detect(const unsigned char* rgba_pixels, int width, int height
             int luma = (p[0] * 77 + p[1] * 150 + p[2] * 29) >> 8;
             sum_lum += luma;
             sample_count++;
-            hist[luma]++;
-
-            // Mid-shadow pixels for sensor chromatic balance (Gray-World)
-            if (luma > 2 && luma < 60) {
-                sum_r += p[0];
-                sum_g += p[1];
-                sum_b += p[2];
-                shadow_samples++;
-            }
         }
     }
     float mean_lum = (sample_count > 0) ? (static_cast<float>(sum_lum) / sample_count) : 128.0f;
 
-    // If scene is in low light / darkness (< 65 luma), apply SOTA Task-Driven Contrast
-    // Enhancement with Zero Milky Wash:
-    // 1. Black pedestal preservation: keeps pure dark background deep and crisp (no white milk).
-    // 2. High-dynamic-range rational contrast curve: amplifies midtones (face, hair, silhouette)
-    //    into YOLOv8's optimal feature-activation dynamic range without distorting natural chromatic ratios.
-    // 3. Subtle chromatic balance: prevents purple sensor drift while maintaining biological skin warmth.
-    // 4. Ultra-fast ARM NEON SIMD acceleration (<0.01 ms).
+    // Apply CLAHE on luma + transfer gain uniformly to RGB + temporal EMA
     if (mean_lum < 65.0f) {
-        float t = std::clamp((65.0f - mean_lum) / 60.0f, 0.0f, 1.0f);
-
-        // Noise floor pedestal estimation (5th percentile of active frame)
-        int p5_thresh = sample_count * 5 / 100;
-        int cum = 0;
-        float pedestal = 1.5f;
-        for (int i = 1; i < 256; ++i) {
-            cum += hist[i];
-            if (cum >= p5_thresh) {
-                pedestal = static_cast<float>(i);
-                break;
-            }
-        }
-        pedestal = std::clamp(pedestal, 1.0f, 3.0f);
-
-        // Chromatic balance: subtle gating that prevents purple sensor drift
-        // without destroying the biological R > G > B skin ratio needed by YOLO convolutions
-        float avg_r = (shadow_samples > 0) ? (sum_r / shadow_samples) : 1.0f;
-        float avg_g = (shadow_samples > 0) ? (sum_g / shadow_samples) : 1.0f;
-        float avg_b = (shadow_samples > 0) ? (sum_b / shadow_samples) : 1.0f;
-        float shadow_y = 0.299f * avg_r + 0.587f * avg_g + 0.114f * avg_b;
-
-        float kr = std::clamp(shadow_y / std::max(avg_r, 0.5f), 0.94f, 1.06f);
-        float kg = std::clamp(shadow_y / std::max(avg_g, 0.5f), 0.94f, 1.08f);
-        float kb = std::clamp(shadow_y / std::max(avg_b, 0.5f), 0.94f, 1.06f);
-
-        // High Dynamic Range Rational Contrast LUT:
-        // Pure dark background (<= pedestal) remains pure dark (0..3).
-        // Midtone face and silhouette (6..25) are boosted 3.5x into vivid 25..90 range.
-        // Highlights smoothly compress towards 220..240 without blowout.
-        float gain = 1.0f + 2.80f * t;
-        float M = 240.0f;
-        float lut[256];
-        for (int i = 0; i < 256; ++i) {
-            float val = static_cast<float>(i);
-            if (val <= pedestal) {
-                lut[i] = val * (1.0f - t * 0.5f);
-            } else {
-                float s = val - pedestal;
-                float boosted = (gain * s) / (1.0f + (gain * s) / M);
-                lut[i] = std::clamp((1.0f - t) * val + t * boosted, 0.0f, 255.0f);
-            }
-        }
-
-        float* r_ptr = input.channel(0);
-        float* g_ptr = input.channel(1);
-        float* b_ptr = input.channel(2);
-        constexpr int N = kInputW * kInputH;
-
-#if defined(__ARM_NEON) || defined(__aarch64__)
-        float32x4_t v_kr = vdupq_n_f32(kr);
-        float32x4_t v_kg = vdupq_n_f32(kg);
-        float32x4_t v_kb = vdupq_n_f32(kb);
-        float32x4_t v_half = vdupq_n_f32(0.5f);
-        float32x4_t v_zero = vdupq_n_f32(0.0f);
-        float32x4_t v_255  = vdupq_n_f32(255.0f);
-
-        for (int i = 0; i <= N - 4; i += 4) {
-            float32x4_t vr = vmulq_f32(vld1q_f32(r_ptr + i), v_kr);
-            float32x4_t vg = vmulq_f32(vld1q_f32(g_ptr + i), v_kg);
-            float32x4_t vb = vmulq_f32(vld1q_f32(b_ptr + i), v_kb);
-
-            int32x4_t ir = vmaxq_s32(vdupq_n_s32(0), vminq_s32(vcvtq_s32_f32(vaddq_f32(vr, v_half)), vdupq_n_s32(255)));
-            int32x4_t ig = vmaxq_s32(vdupq_n_s32(0), vminq_s32(vcvtq_s32_f32(vaddq_f32(vg, v_half)), vdupq_n_s32(255)));
-            int32x4_t ib = vmaxq_s32(vdupq_n_s32(0), vminq_s32(vcvtq_s32_f32(vaddq_f32(vb, v_half)), vdupq_n_s32(255)));
-
-            alignas(16) int arr_r[4], arr_g[4], arr_b[4];
-            vst1q_s32(arr_r, ir);
-            vst1q_s32(arr_g, ig);
-            vst1q_s32(arr_b, ib);
-
-            alignas(16) float rout[4], gout[4], bout[4];
-            rout[0] = lut[arr_r[0]]; rout[1] = lut[arr_r[1]]; rout[2] = lut[arr_r[2]]; rout[3] = lut[arr_r[3]];
-            gout[0] = lut[arr_g[0]]; gout[1] = lut[arr_g[1]]; gout[2] = lut[arr_g[2]]; gout[3] = lut[arr_g[3]];
-            bout[0] = lut[arr_b[0]]; bout[1] = lut[arr_b[1]]; bout[2] = lut[arr_b[2]]; bout[3] = lut[arr_b[3]];
-
-            vst1q_f32(r_ptr + i, vld1q_f32(rout));
-            vst1q_f32(g_ptr + i, vld1q_f32(gout));
-            vst1q_f32(b_ptr + i, vld1q_f32(bout));
-        }
-#else
-        for (int i = 0; i < N; ++i) {
-            int ir = std::clamp(static_cast<int>(r_ptr[i] * kr + 0.5f), 0, 255);
-            int ig = std::clamp(static_cast<int>(g_ptr[i] * kg + 0.5f), 0, 255);
-            int ib = std::clamp(static_cast<int>(b_ptr[i] * kb + 0.5f), 0, 255);
-            r_ptr[i] = lut[ir];
-            g_ptr[i] = lut[ig];
-            b_ptr[i] = lut[ib];
-        }
-#endif
+        float t = std::clamp((65.0f - mean_lum) / 60.0f, 0.25f, 0.85f);
+        enhance_lowlight(input, t);
     }
 
     // YOLOv8 input normalization: 0..255 -> 0.0..1.0
@@ -269,18 +253,6 @@ int HeadDetector::detect(const unsigned char* rgba_pixels, int width, int height
         float bbox_w  = ptr_w[i]  * inv_w;
         float bbox_h  = ptr_h[i]  * inv_h;
 
-        // Circular Telegram video attention prior:
-        // Candidates located in extreme corners outside the Telegram round circle (r > 0.52)
-        // are never visible in the round video message; apply progressive confidence penalty.
-        float dx = bbox_cx - 0.5f;
-        float dy = bbox_cy - 0.5f;
-        float dist_sq = dx * dx + dy * dy;
-        if (dist_sq > 0.27f) {
-            float dist = std::sqrt(dist_sq);
-            float corner_penalty = (dist - 0.52f) * 1.5f;
-            if (prob < prob_threshold + corner_penalty) continue;
-        }
-
         float xmin = std::max(0.0f, std::min(1.0f, bbox_cx - bbox_w * 0.5f));
         float ymin = std::max(0.0f, std::min(1.0f, bbox_cy - bbox_h * 0.5f));
         float xmax = std::max(0.0f, std::min(1.0f, bbox_cx + bbox_w * 0.5f));
@@ -288,11 +260,6 @@ int HeadDetector::detect(const unsigned char* rgba_pixels, int width, int height
 
         float bw = xmax - xmin;
         float bh = ymax - ymin;
-
-        // Circular mask upper sensor boundary clip:
-        // Boxes touching extreme top border (ymin <= 0.005) with small height (bh <= 0.15)
-        // correspond to sensor clipping artifacts or fingers on phone edge.
-        if (ymin <= 0.005f && bh <= 0.15f) continue;
 
         // Physical bounding box sanity checks:
         // - Min: 5% width, 5% height (rejects tiny noise artifacts)
