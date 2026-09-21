@@ -99,7 +99,7 @@ void HeadDetector::enhance_lowlight(ncnn::Mat& in, float t, float alpha) {
 
     // clipped CDF -> mapping, + временной EMA
     const int pixels_per_tile = tw * th;
-    const float clip = 3.0f * pixels_per_tile / kBins;  // clip limit 3.0
+    const float clip = 2.2f * pixels_per_tile / kBins;  // clip limit 2.2 (suppresses clutter noise)
     float map_[kTilesY][kTilesX][kBins];
 
     for (int ty = 0; ty < kTilesY; ++ty) {
@@ -229,7 +229,7 @@ int HeadDetector::detect(const unsigned char* rgba_pixels, int width, int height
     if (enhance_on_ && mean_lum > 70.0f) enhance_on_ = false;
 
     if (enhance_on_) {
-        float t = std::clamp((70.0f - mean_lum) / 60.0f, 0.0f, 0.85f);
+        float t = std::clamp((70.0f - mean_lum) / 60.0f, 0.0f, 0.70f);
         // Scene cut / lights toggled -> adapt fast, otherwise smooth hard.
         float delta = std::fabs(mean_lum - prev_mean_lum_);
         float alpha = (delta > 18.0f) ? 0.8f : 0.3f;
@@ -289,8 +289,15 @@ int HeadDetector::detect(const unsigned char* rgba_pixels, int width, int height
         // - Max: 100% width, 100% height (supports full-frame close-up selfies)
         if (bw < 0.05f || bh < 0.05f || bw > 1.0f || bh > 1.0f) continue;
 
-        // Small clutter discrimination
-        if ((bw < 0.11f || bh < 0.13f) && prob < 0.38f) continue;
+        // Circular Telegram video attention prior:
+        // Exclude candidates whose centers are outside the round circle boundary (r > 0.52).
+        // Round circle radius is exactly 0.50; r > 0.52 lies completely in the cropped invisible corner.
+        float c_dx = bbox_cx - 0.5f;
+        float c_dy = bbox_cy - 0.5f;
+        if (c_dx * c_dx + c_dy * c_dy > 0.27f) continue;
+
+        // Small clutter discrimination: micro-objects require high confidence
+        if ((bw < 0.12f || bh < 0.14f) && prob < 0.45f) continue;
 
         // Aspect ratio [0.35, 2.50] supports all head tilts, profile turns, and full 360° poses
         float aspect = bw / bh;
