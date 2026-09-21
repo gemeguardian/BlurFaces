@@ -110,6 +110,17 @@ Java_com_makey_blurfaces_g2_NativeBridge_process(JNIEnv* env, jclass,
     float low_thresh = std::max(0.12f, high_thresh * 0.55f);
     float instant_thresh = std::max(0.35f, std::min(0.60f, high_thresh + 0.05f));
 
+    // Low-light relaxation: model confidence physically drops in darkness, so
+    // keeping daylight thresholds costs recall. Uses the previous frame's
+    // luminance (1-frame lag is irrelevant at 30 fps).
+    float scene_lum = g_detector->last_mean_lum();
+    if (scene_lum < 45.0f) {
+        float k = std::clamp((45.0f - scene_lum) / 35.0f, 0.0f, 1.0f);
+        high_thresh    = std::max(0.14f, high_thresh    * (1.0f - 0.35f * k));
+        low_thresh     = std::max(0.10f, low_thresh     * (1.0f - 0.35f * k));
+        instant_thresh = std::max(0.28f, instant_thresh * (1.0f - 0.30f * k));
+    }
+
     // Run NCNN Head Detection with low_thresh as detection floor
     std::vector<HeadBox> detected_heads;
     g_detector->detect(pixels, width, height, detected_heads, low_thresh, 0.45f);

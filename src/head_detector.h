@@ -26,11 +26,15 @@ public:
                std::vector<HeadBox>& heads,
                float prob_threshold = 0.25f, float nms_threshold = 0.45f);
 
+    // Mean luminance of the last processed frame (0..255). Used to relax
+    // tracker thresholds in low light.
+    float last_mean_lum() const { return prev_mean_lum_; }
+
     bool is_initialized() const { return initialized_; }
     void clear();
 
 private:
-    void enhance_lowlight(ncnn::Mat& in, float t);
+    void enhance_lowlight(ncnn::Mat& in, float t, float alpha);
 
     ncnn::Net net_;
     bool initialized_ = false;
@@ -42,6 +46,8 @@ private:
 
     float ema_lut_[kTilesY][kTilesX][kBins];
     bool ema_init_ = false;
+    bool enhance_on_ = false;
+    float prev_mean_lum_ = 128.0f;
     std::vector<float> y_buf_;
 };
 

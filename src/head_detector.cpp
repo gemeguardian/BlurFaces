@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <vector>
 
 #if defined(__ARM_NEON) || defined(__aarch64__)
@@ -62,11 +63,14 @@ void HeadDetector::clear() {
     net_.clear();
     initialized_ = false;
     ema_init_ = false;
+    enhance_on_ = false;
+    prev_mean_lum_ = 128.0f;
     memset(ema_lut_, 0, sizeof(ema_lut_));
 }
 
-void HeadDetector::enhance_lowlight(ncnn::Mat& in, float t) {
+void HeadDetector::enhance_lowlight(ncnn::Mat& in, float t, float alpha) {
     // t in (0,1] — сила эффекта, из mean_lum
+    // alpha — коэффициент временного EMA (больше = быстрее адаптация к смене сцены)
     float* R = in.channel(0);
     float* G = in.channel(1);
     float* B = in.channel(2);
@@ -117,7 +121,7 @@ void HeadDetector::enhance_lowlight(ncnn::Mat& in, float t) {
                 float idn = (b + 0.5f) * (256.0f / kBins);        // исходное
                 float v   = (1.0f - t) * idn + t * eq;            // сила эффекта
                 map_[ty][tx][b] = ema_init_
-                    ? 0.7f * ema_lut_[ty][tx][b] + 0.3f * v       // антимигание
+                    ? (1.0f - alpha) * ema_lut_[ty][tx][b] + alpha * v  // антимигание
                     : v;
                 ema_lut_[ty][tx][b] = map_[ty][tx][b];
             }
@@ -138,10 +142,19 @@ void HeadDetector::enhance_lowlight(ncnn::Mat& in, float t) {
             float wx = std::clamp(fx - x0, 0.0f, 1.0f);
 
             int i = y * W + x;
-            int b = std::clamp(static_cast<int>(Y[i] * (kBins / 256.0f)), 0, kBins - 1);
 
-            float v = (1.0f - wy) * ((1.0f - wx) * map_[y0][x0][b] + wx * map_[y0][x1][b])
-                    +         wy  * ((1.0f - wx) * map_[y1][x0][b] + wx * map_[y1][x1][b]);
+            // Интерполяция ещё и по бинам яркости: без неё все пиксели одного
+            // бина получают одинаковый target -> контуринг на плавных градиентах.
+            float fb = Y[i] * (kBins / 256.0f) - 0.5f;
+            int b0 = std::clamp(static_cast<int>(std::floor(fb)), 0, kBins - 1);
+            int b1 = std::min(b0 + 1, kBins - 1);
+            float wb = std::clamp(fb - b0, 0.0f, 1.0f);
+
+            float v0 = (1.0f - wy) * ((1.0f - wx) * map_[y0][x0][b0] + wx * map_[y0][x1][b0])
+                     +         wy  * ((1.0f - wx) * map_[y1][x0][b0] + wx * map_[y1][x1][b0]);
+            float v1 = (1.0f - wy) * ((1.0f - wx) * map_[y0][x0][b1] + wx * map_[y0][x1][b1])
+                     +         wy  * ((1.0f - wx) * map_[y1][x0][b1] + wx * map_[y1][x1][b1]);
+            float v = (1.0f - wb) * v0 + wb * v1;
 
             float gain = std::clamp((v + 1.0f) / (Y[i] + 1.0f), 1.0f, 4.0f);
             R[i] = std::min(R[i] * gain, 255.0f);
@@ -208,11 +221,21 @@ int HeadDetector::detect(const unsigned char* rgba_pixels, int width, int height
     }
     float mean_lum = (sample_count > 0) ? (static_cast<float>(sum_lum) / sample_count) : 128.0f;
 
-    // Apply CLAHE on luma + transfer gain uniformly to RGB + temporal EMA
-    if (mean_lum < 65.0f) {
-        float t = std::clamp((65.0f - mean_lum) / 60.0f, 0.25f, 0.85f);
-        enhance_lowlight(input, t);
+    // Apply CLAHE on luma + transfer gain uniformly to RGB + temporal EMA.
+    // Nominal low-light working point is mean_lum < 65.0f; hysteresis around it
+    // (on below 62, off above 70) prevents on/off flicker when the scene sits
+    // right on the boundary. t ramps continuously from 0 so there is no step.
+    if (!enhance_on_ && mean_lum < 62.0f) enhance_on_ = true;
+    if (enhance_on_ && mean_lum > 70.0f) enhance_on_ = false;
+
+    if (enhance_on_) {
+        float t = std::clamp((70.0f - mean_lum) / 60.0f, 0.0f, 0.85f);
+        // Scene cut / lights toggled -> adapt fast, otherwise smooth hard.
+        float delta = std::fabs(mean_lum - prev_mean_lum_);
+        float alpha = (delta > 18.0f) ? 0.8f : 0.3f;
+        enhance_lowlight(input, t, alpha);
     }
+    prev_mean_lum_ = mean_lum;
 
     // YOLOv8 input normalization: 0..255 -> 0.0..1.0
     const float mean_vals[3] = {0.0f, 0.0f, 0.0f};
