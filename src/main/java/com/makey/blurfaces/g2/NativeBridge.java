@@ -22,6 +22,11 @@ public final class NativeBridge {
                                      float[] outGeometry, float[] outScores, float[] outYaws,
                                      int maxFaces, float minConfidence);
 
+    // Same inference and tracker update; additionally returns a bounded diagnostic snapshot.
+    public static native int processDebug(ByteBuffer rgbaBuffer, int width, int height,
+                                          float[] outGeometry, float[] outScores, float[] outYaws,
+                                          int maxFaces, float minConfidence, float[] debugSnapshot);
+
     public static native void reset();
 
     public static native void cleanup();

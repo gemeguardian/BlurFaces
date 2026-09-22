@@ -65,7 +65,7 @@ import org.telegram.messenger.R;
 import org.telegram.messenger.SvgHelper;
 import org.telegram.ui.ActionBar.Theme;
 
-/** Round-video face blur whose sole geometry source is MediaPipe Face Landmarker. */
+/** Round-video head protection using native YOLOv8/ByteTrack geometry. */
 public final class Main {
     private static final String TAG = "BlurFaces";
     private static final String CAMERA_GL_THREAD =
@@ -170,6 +170,32 @@ public final class Main {
     private static long lastMetricsLogNanos;
     private static long framesCaptured, framesProcessed, framesDropped, inferenceNanos;
     private static Consumer<String> logger;
+    private static volatile DebugCapture debugCapture;
+
+    public static synchronized void setDebugCapture(String value, String bundleId) throws Exception {
+        if (debugCapture == null) {
+            Context context = ApplicationLoader.applicationContext;
+            if (context == null) throw new IllegalStateException("Application context unavailable");
+            debugCapture = new DebugCapture(new java.io.File(context.getNoBackupFilesDir(),
+                    "blur_faces_debug").toPath());
+        }
+        debugCapture.configure("true".equals(value), bundleId);
+    }
+
+    public static boolean isDebugCaptureEnabled() {
+        DebugCapture capture = debugCapture;
+        return capture != null && capture.store.enabled(System.nanoTime());
+    }
+
+    public static String getDebugCaptureStatus() throws Exception {
+        DebugCapture capture = debugCapture;
+        return capture == null ? "state=off" : capture.store.status(System.nanoTime());
+    }
+
+    public static String clearDebugCaptures() throws Exception {
+        DebugCapture capture = debugCapture;
+        return "deleted=" + (capture == null ? 0 : capture.store.clear());
+    }
 
     private static final String VS =
             "uniform mat4 uMVPMatrix;uniform mat4 uSTMatrix;attribute vec4 aPosition;" +
@@ -418,7 +444,7 @@ public final class Main {
             }
 
             return String.format(java.util.Locale.US,
-                    "PASSED: Face obliterated, contrast reduced by %.1f%%, detector score < 0.15",
+                    "PASSED: Synthetic CPU mask contrast reduced by %.1f%%; detector, GPU and encoder not tested",
                     contrastReduction);
         } catch (Throwable error) {
             emit("runPrivacySelfTest failed: " + error);
@@ -1217,7 +1243,18 @@ public final class Main {
                 emit("Preview multi-pass Gaussian ready size=" + CleanFrameTap.SIZE + "x" + CleanFrameTap.SIZE);
             }
             bindPreviewBlur(state);
-            processOpticalFlow(state, source, now);
+            long pixelsNanos = state.tap.readbackNanos();
+            if (pixelsNanos == 0L) {
+                invalidateResult(source);
+                throw new IllegalStateException("Clean frame readback failed");
+            }
+            // Warm-up can deliver the first PBO image twice. Never infer/track it twice.
+            if (pixelsNanos <= state.lastReadbackNanos) {
+                if (frameBuffer != null) FRAME_POOL.offer(frameBuffer);
+                return;
+            }
+            state.lastReadbackNanos = pixelsNanos;
+            processOpticalFlow(state, source, pixelsNanos);
             SOURCE_BY_SLOT.put(slot, source);
             SOURCE_BY_TEXTURE.put(textures[slot], source);
             boolean awaitingFirst = !hasFreshResult(source, now);
@@ -1226,7 +1263,7 @@ public final class Main {
                 frameBuffer.clear();
                 copyVerticallyCorrected(state.readPixels, frameBuffer, CleanFrameTap.SIZE, CleanFrameTap.SIZE);
                 frameBuffer.position(0);
-                CapturedFrame next = new CapturedFrame(frameBuffer, now, nextTimestampMs(now), source);
+                CapturedFrame next = new CapturedFrame(frameBuffer, pixelsNanos, nextTimestampMs(pixelsNanos), source);
                 frameBuffer = null;
                 CapturedFrame old = LATEST_FRAME.getAndSet(next);
                 if (old != null) {
@@ -1345,58 +1382,6 @@ public final class Main {
         }
     }
 
-    private static java.io.File getDebugDir() {
-        try {
-            java.io.File base = null;
-            try {
-                Class<?> appLoader = Class.forName("org.telegram.messenger.ApplicationLoader");
-                Method method = appLoader.getDeclaredMethod("getFilesDirFixed");
-                base = (java.io.File) method.invoke(null);
-            } catch (Throwable ignored) { }
-            if (base == null) {
-                base = new java.io.File("/data/data/com.exteragram.messenger/files");
-            }
-            java.io.File dir = new java.io.File(base, "blurfaces_storage");
-            if (!dir.exists()) dir.mkdirs();
-            return dir;
-        } catch (Throwable t) {
-            java.io.File fallback = new java.io.File("/data/data/com.exteragram.messenger/files/blurfaces_storage");
-            if (!fallback.exists()) fallback.mkdirs();
-            return fallback;
-        }
-    }
-
-    private static long lastDebugFrameSavedNanos = 0L;
-    private static void maybeSaveDebugFrame(ByteBuffer rgba, int count, float score, float cx, float cy) {
-        long now = System.nanoTime();
-        long minInterval = (count > 0) ? 400_000_000L : 1_500_000_000L;
-        if (now - lastDebugFrameSavedNanos < minInterval) return;
-        lastDebugFrameSavedNanos = now;
-        try {
-            java.io.File dir = getDebugDir();
-            ByteBuffer copy = ByteBuffer.allocateDirect(rgba.capacity());
-            rgba.position(0);
-            copy.put(rgba);
-            rgba.position(0);
-            copy.position(0);
-            new Thread(() -> {
-                try {
-                    android.graphics.Bitmap bmp = android.graphics.Bitmap.createBitmap(
-                            CleanFrameTap.SIZE, CleanFrameTap.SIZE, android.graphics.Bitmap.Config.ARGB_8888);
-                    bmp.copyPixelsFromBuffer(copy);
-                    long ts = System.currentTimeMillis();
-                    java.io.File file = new java.io.File(dir, String.format(java.util.Locale.US,
-                            "frame_%d_c%d_s%d_y%d.jpg", ts, count, (int)(score * 100), (int)(cy * 100)));
-                    try (java.io.FileOutputStream out = new java.io.FileOutputStream(file)) {
-                        bmp.compress(android.graphics.Bitmap.CompressFormat.JPEG, 88, out);
-                    }
-                    bmp.recycle();
-                    emit("Saved clean debug frame: " + file.getName());
-                } catch (Throwable ignored) { }
-            }).start();
-        } catch (Throwable ignored) { }
-    }
-
     private static void submitLatestFrame() {
         CapturedFrame frame = LATEST_FRAME.getAndSet(null);
         if (frame == null) { DRAIN_SCHEDULED.set(false); return; }
@@ -1407,6 +1392,8 @@ public final class Main {
             if (acceptingFrames && LATEST_FRAME.get() != null) scheduleDrain();
             return;
         }
+        DebugCapture capture = debugCapture;
+        long debugToken = capture == null ? 0L : capture.store.reserve(System.nanoTime());
         try {
             long inferenceStart = System.nanoTime();
             frame.rgba.position(0);
@@ -1415,18 +1402,35 @@ public final class Main {
             float[] outScores = new float[MAX_FACES];
             float[] outYaws = new float[MAX_FACES];
 
-            int count = NativeBridge.process(frame.rgba, CleanFrameTap.SIZE, CleanFrameTap.SIZE,
-                    outGeometry, outScores, outYaws, MAX_FACES, configuredConfidence);
-
-            maybeSaveDebugFrame(frame.rgba, count, count > 0 ? outScores[0] : 0f,
-                    count > 0 ? outGeometry[0] : 0f, count > 0 ? outGeometry[1] : 0f);
+            float confidence = configuredConfidence;
+            float[] debugSnapshot = debugToken == 0L ? null : new float[DebugCapture.SNAPSHOT_FLOATS];
+            int count = debugSnapshot == null
+                    ? NativeBridge.process(frame.rgba, CleanFrameTap.SIZE, CleanFrameTap.SIZE,
+                            outGeometry, outScores, outYaws, MAX_FACES, confidence)
+                    : NativeBridge.processDebug(frame.rgba, CleanFrameTap.SIZE, CleanFrameTap.SIZE,
+                            outGeometry, outScores, outYaws, MAX_FACES, confidence, debugSnapshot);
+            long resultNanos = System.nanoTime();
 
             FaceGeometry detections = new FaceGeometry(outGeometry, outScores, outYaws, count,
                     frame.captureNanos, frame.sourceKey);
 
+            // A switch may happen while native inference is running.
+            if (frame.captureNanos < LAST_CAMERA_SWITCH_NANOS.get()) return;
             if (isSourceActive(frame.sourceKey)) {
-                recordStaleness(System.nanoTime() - frame.captureNanos);
-                updateTracks(frame.sourceKey, detections);
+                recordStaleness(resultNanos - frame.captureNanos);
+                try {
+                    updateTracks(frame.sourceKey, detections);
+                } finally {
+                    if (debugToken != 0L) {
+                        SourceTracks tracks = SOURCE_TRACKS.get(frame.sourceKey);
+                        capture.submit(debugToken, frame.rgba, CleanFrameTap.SIZE, CleanFrameTap.SIZE,
+                                debugSnapshot, count, confidence, frame.captureNanos, resultNanos,
+                                resultNanos - inferenceStart, frame.sourceKey,
+                                tracks == null ? new float[0] : tracks.debugSnapshot(resultNanos),
+                                blurEnabled, maskMode);
+                        debugToken = 0L; // Writer owns a copy, not the pooled frame.
+                    }
+                }
                 releaseFirstDetectionLatch(frame.sourceKey);
                 framesProcessed++;
                 inferenceNanos += System.nanoTime() - inferenceStart;
@@ -1436,10 +1440,12 @@ public final class Main {
                 emit("Dropped late result from retired source=" + frame.sourceKey);
             }
         } catch (Throwable error) {
+            invalidateResult(frame.sourceKey);
             releaseFirstDetectionLatch(frame.sourceKey);
             if (blurEnabled) setProtectionState("DEGRADED");
             emit("Native head detection frame failed", error);
         } finally {
+            if (debugToken != 0L) capture.store.release();
             releaseFirstDetectionLatch(frame.sourceKey);
             FRAME_POOL.offer(frame.rgba);
             DRAIN_SCHEDULED.set(false);
@@ -1956,6 +1962,11 @@ public final class Main {
         emit("Camera source changed; full-frame privacy blur active until fresh detection source=" + source);
     }
 
+    static void invalidateResult(String source) {
+        if (source == null || source.isEmpty()) return;
+        SOURCE_TRACKS.computeIfAbsent(source, ignored -> new SourceTracks()).invalidate();
+    }
+
     static void updateTracks(String source, FaceGeometry detections) {
         SourceTracks tracks = SOURCE_TRACKS.computeIfAbsent(source, ignored -> new SourceTracks());
         tracks.update(detections, System.nanoTime());
@@ -2069,6 +2080,7 @@ public final class Main {
     public static synchronized boolean onUnload() {
         boolean clean = true;
         acceptingFrames = false;
+        if (debugCapture != null) debugCapture.stop();
         setProtectionState("STOPPING");
         for (XC_MethodHook.Unhook hook : HOOKS) try { hook.unhook(); } catch (Throwable ignored) { }
         HOOKS.clear();
@@ -2130,7 +2142,7 @@ public final class Main {
         int program, position, texture, mvp, st, center, axisX, axisY, count, viewport, blurSampler, pixelGrid, faceCount;
         int savedProgram, savedPosition, savedTexture, savedMvp, savedSt, blurTexture, savedBlurBinding;
         int fallbackProgram, fallbackPosition, fallbackMvp, fallbackTexture;
-        boolean swapActive, blurBindingActive, pipelineLogged; long lastCaptureNanos;
+        boolean swapActive, blurBindingActive, pipelineLogged; long lastCaptureNanos, lastReadbackNanos;
         long captureIntervalNanos = CAPTURE_INTERVAL_NS; ByteBuffer readPixels; String activeSource;
         final SparseLucasKanadeTracker flowTracker = new SparseLucasKanadeTracker();
         float[] prevFlowGray = new float[CleanFrameTap.SIZE * CleanFrameTap.SIZE];
@@ -2556,6 +2568,23 @@ public final class Main {
         }
     }
 
+    static boolean validNativeResult(FaceGeometry result) {
+        if (result == null || result.count < 0 || result.count > MAX_FACES
+                || result.faces == null || result.faces.length < result.count * FACE_STRIDE
+                || result.scores == null || result.scores.length < result.count) return false;
+        for (int i = 0; i < result.count; i++) {
+            float score = result.scores[i];
+            if (!Float.isFinite(score) || score < 0f || score > 1f) return false;
+            int offset = i * FACE_STRIDE;
+            for (int j = 0; j < FACE_STRIDE; j++)
+                if (!Float.isFinite(result.faces[offset + j])) return false;
+            float determinant = result.faces[offset + 2] * result.faces[offset + 5]
+                    - result.faces[offset + 3] * result.faces[offset + 4];
+            if (!Float.isFinite(determinant) || Math.abs(determinant) < 0.000001f) return false;
+        }
+        return true;
+    }
+
     static final class SourceTracks {
         final FaceTrack[] tracks = new FaceTrack[MAX_FACES];
         final boolean[] trackMatched = new boolean[MAX_FACES];
@@ -2575,7 +2604,20 @@ public final class Main {
 
         synchronized long lastFaceNanos() { return lastFaceNanos; }
 
+        synchronized void invalidate() {
+            java.util.Arrays.fill(tracks, null);
+            lastPublishedNanos = 0L;
+            lastResultNanos = 0L;
+            adaptiveHoldNanos = TRACK_HOLD_NS;
+        }
+
         synchronized void update(FaceGeometry detections, long publishedNanos) {
+            // Negative JNI status, malformed arrays, and non-finite geometry are
+            // failures, never fresh evidence of an empty scene.
+            if (!validNativeResult(detections)) {
+                invalidate();
+                throw new IllegalArgumentException("Invalid native detection result");
+            }
             if (lastPublishedNanos != 0L) {
                 long interval = publishedNanos - lastPublishedNanos;
                 adaptiveHoldNanos = Math.max(TRACK_HOLD_NS,
@@ -2599,9 +2641,8 @@ public final class Main {
                             || publishedNanos - track.lastSeenPublishedNanos > holdLimit(track)) continue;
                     for (int d = 0; d < detections.count; d++) {
                         if (detectionMatched[d]) continue;
-                        float score = detections.scores != null && d < detections.scores.length
-                                ? detections.scores[d] : 1.0f;
-                        if (score < TRACK_GATED_MIN_CONFIDENCE) continue;
+                        // Native ByteTrack already confirmed this head, including
+                        // low-light and low-score continuation rules.
                         int offset = d * FACE_STRIDE;
                         float dx = detections.faces[offset] - track.values[0];
                         float dy = detections.faces[offset + 1] - track.values[1];
@@ -2622,11 +2663,9 @@ public final class Main {
                 detectionMatched[bestDetection] = true;
                 acceptedAnyFace = true;
             }
-            float newTrackThreshold = Math.max(TRACK_NEW_MIN_CONFIDENCE, configuredConfidence);
+            // This layer smooths confirmed native tracks; it must not impose a
+            // second confidence threshold which cancels native low-light recall.
             for (int d = 0; d < detections.count; d++) if (!detectionMatched[d]) {
-                float score = detections.scores != null && d < detections.scores.length
-                                ? detections.scores[d] : 1.0f;
-                if (score < newTrackThreshold) continue;
                 int slot = replacementSlot(publishedNanos);
                 if (slot >= 0) {
                     float detectionYaw = (detections.yaws != null && d < detections.yaws.length)
@@ -2668,6 +2707,22 @@ public final class Main {
                 count++;
             }
             return count == 0 ? null : new FaceGeometry(output, FaceGeometry.defaultScores(count), yaws, count, lastResultNanos, source);
+        }
+
+        // Read-only diagnostic state: do NOT call predict()/geometryAt(), which advance smoothing.
+        synchronized float[] debugSnapshot(long now) {
+            float[] result = new float[MAX_FACES * 10];
+            int p = 0;
+            for (FaceTrack track : tracks) {
+                if (track == null || now - track.lastSeenPublishedNanos > holdLimit(track)) continue;
+                System.arraycopy(track.values, 0, result, p, FACE_STRIDE);
+                result[p + 6] = track.drawCenter[0];
+                result[p + 7] = track.drawCenter[1];
+                result[p + 8] = Math.max(0L, now - track.lastSeenNanos) / 1_000_000f;
+                result[p + 9] = Math.max(0L, now - track.lastSeenPublishedNanos) / 1_000_000f;
+                p += 10;
+            }
+            return java.util.Arrays.copyOf(result, p);
         }
 
         synchronized boolean hasFreshPublication(long now) {

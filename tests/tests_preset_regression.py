@@ -12,7 +12,9 @@ class PresetRegressionTest(unittest.TestCase):
         self.assertNotIn("model_rows", SOURCE)
         self.assertNotIn("PRESET_PROFILES", SOURCE)
         self.assertIn("ROUND_VIDEO_WIDTHS", SOURCE)
-        self.assertIn("FACE_MASK_SCALES", SOURCE)
+        self.assertIn("FACE_MASK_SCALE = 100", SOURCE)
+        self.assertNotIn("FACE_MASK_SCALES", SOURCE)
+        self.assertNotIn("self.face_mask_index", SOURCE)
         self.assertIn("DETECTION_CONFIDENCES", SOURCE)
         self.assertIn("MASK_MODES", SOURCE)
 

@@ -87,12 +87,17 @@ class HookContract(unittest.TestCase):
         self.assertIn("MAX_TRACK_HOLD_NS = 1_200_000_000L", MAIN)
         self.assertNotIn("HELD_RESULTS", MAIN)
 
-    def test_two_level_confidence_hysteresis(self):
-        self.assertIn("TRACK_GATED_MIN_CONFIDENCE = 0.20f;", MAIN)
-        self.assertIn("TRACK_NEW_MIN_CONFIDENCE = 0.20f;", MAIN)
-        self.assertIn("score < TRACK_GATED_MIN_CONFIDENCE", MAIN)
-        self.assertIn("score < newTrackThreshold", MAIN)
-        self.assertIn("Math.max(TRACK_NEW_MIN_CONFIDENCE, configuredConfidence)", MAIN)
+    def test_native_confirmation_is_not_filtered_again_in_java(self):
+        tracker = MAIN[MAIN.index("static final class SourceTracks") :]
+        self.assertNotIn("configuredConfidence", tracker)
+        self.assertNotIn("score <", tracker)
+        self.assertIn("validNativeResult(detections)", tracker)
+        self.assertIn("invalidate();", tracker)
+
+    def test_clean_frames_are_never_persisted(self):
+        self.assertNotIn("maybeSaveDebugFrame", MAIN)
+        self.assertNotIn("FileOutputStream", MAIN)
+        self.assertNotIn("CompressFormat.JPEG", MAIN)
 
     def test_anti_overshoot_prediction_bounded(self):
         self.assertIn("float posHorizon = (speed < TRACK_SPEED_DEADBAND) ? 0f : Math.min(0.025f, stale);", MAIN)

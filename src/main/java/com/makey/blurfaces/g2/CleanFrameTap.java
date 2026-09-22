@@ -38,6 +38,9 @@ final class CleanFrameTap {
     private final int[] textures = new int[2];
     private final int[] fbos = new int[2];
     private final int[] pbos = new int[PBO_COUNT];
+    private final long[] pboCaptureNanos = new long[PBO_COUNT];
+    private long readbackNanos;
+    long readbackNanos() { return readbackNanos; }
     private int pboIndex = 0;
     private boolean pboInitialized = false;
     private boolean pboPrimed = false;
@@ -110,9 +113,13 @@ final class CleanFrameTap {
             GLES20.glBindTexture(GL_TEXTURE_EXTERNAL_OES, oesTexture);
             GLES20.glUniform1i(oesSampler, 0);
             GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4);
+            // Do not let a direct-read fallback hide a failed draw and timestamp
+            // the previous FBO contents as a new camera frame.
+            checkReadError();
             if (cleanReadback != null) {
+                readbackNanos = 0L;
                 try {
-                    readPixelsAsync(cleanReadback);
+                    readbackNanos = readPixelsAsync(cleanReadback);
                 } catch (Throwable readError) {
                     lastError = "readPixels error=" + readError;
                 } finally {
@@ -144,8 +151,10 @@ final class CleanFrameTap {
         }
     }
 
-    private void readPixelsAsync(ByteBuffer cleanReadback) {
-        cleanReadback.position(0);
+    private long readPixelsAsync(ByteBuffer cleanReadback) {
+        cleanReadback.clear();
+        final long captureNanos = System.nanoTime();
+        long resultNanos = captureNanos;
         final int bytes = SIZE * SIZE * 4;
         if (pboSupported) {
             try {
@@ -165,6 +174,8 @@ final class CleanFrameTap {
                     // Trigger asynchronous readback into currently bound PBO
                     GLES30.glBindBuffer(GLES30.GL_PIXEL_PACK_BUFFER, pbos[pboIndex]);
                     GLES30.glReadPixels(0, 0, SIZE, SIZE, GLES30.GL_RGBA, GLES30.GL_UNSIGNED_BYTE, 0);
+                    checkReadError();
+                    pboCaptureNanos[pboIndex] = captureNanos;
 
                     if (pboPrimed) {
                         // Read from the other PBO (which finished transfer from previous frame)
@@ -172,12 +183,16 @@ final class CleanFrameTap {
                         ByteBuffer mapped = (ByteBuffer) GLES30.glMapBufferRange(
                                 GLES30.GL_PIXEL_PACK_BUFFER, 0, bytes, GLES30.GL_MAP_READ_BIT);
                         if (mapped != null) {
+                            boolean unmapped;
                             try {
+                                mapped.position(0); mapped.limit(bytes);
                                 cleanReadback.put(mapped);
                                 cleanReadback.position(0);
+                                resultNanos = pboCaptureNanos[nextIndex];
                             } finally {
-                                GLES30.glUnmapBuffer(GLES30.GL_PIXEL_PACK_BUFFER);
+                                unmapped = GLES30.glUnmapBuffer(GLES30.GL_PIXEL_PACK_BUFFER);
                             }
+                            if (!unmapped) throw new IllegalStateException("PBO data invalidated");
                         } else {
                             // If mapping wasn't ready yet or failed, direct fallback
                             GLES30.glBindBuffer(GLES30.GL_PIXEL_PACK_BUFFER, 0);
@@ -190,8 +205,9 @@ final class CleanFrameTap {
                         pboPrimed = true;
                     }
                     GLES30.glBindBuffer(GLES30.GL_PIXEL_PACK_BUFFER, 0);
+                    checkReadError();
                     pboIndex = nextIndex;
-                    return;
+                    return resultNanos;
                 }
             } catch (Throwable t) {
                 pboSupported = false;
@@ -200,12 +216,17 @@ final class CleanFrameTap {
                 } catch (Throwable ignored) {}
             }
         }
-        // Direct fallback if GLES30 / PBO is not supported
-        try {
-            GLES20.glReadPixels(0, 0, SIZE, SIZE, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, cleanReadback);
-        } catch (Throwable error) {
-            lastError = "direct readPixels error=" + error;
-        }
+        // A failed read must never publish old pixels with a fresh timestamp.
+        drainErrors();
+        cleanReadback.clear();
+        GLES20.glReadPixels(0, 0, SIZE, SIZE, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, cleanReadback);
+        checkReadError();
+        return captureNanos;
+    }
+
+    private static void checkReadError() {
+        int error = GLES20.glGetError();
+        if (error != GLES20.GL_NO_ERROR) throw new IllegalStateException("Readback GL error=" + error);
     }
 
     private void drawBlur(int sourceTexture, int destinationFbo, float x, float y) {
@@ -319,6 +340,8 @@ final class CleanFrameTap {
     void resetPbo() {
         pboPrimed = false;
         pboIndex = 0;
+        readbackNanos = 0L;
+        java.util.Arrays.fill(pboCaptureNanos, 0L);
     }
 
     void release() {

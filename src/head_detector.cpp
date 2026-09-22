@@ -202,6 +202,7 @@ int HeadDetector::detect(const unsigned char* rgba_pixels, int width, int height
     // RGBA to RGB and bilinear resize to 320x320
     ncnn::Mat input = ncnn::Mat::from_pixels_resize(rgba_pixels, ncnn::Mat::PIXEL_RGBA2RGB,
                                                     width, height, kInputW, kInputH);
+    if (input.empty()) return -4;
 
     // Fast adaptive low-light enhancement:
     // Sample frame luminance across a 32x32 grid (1024 samples ~ 0.05 us)
@@ -255,6 +256,14 @@ int HeadDetector::detect(const unsigned char* rgba_pixels, int width, int height
         return -3;
     }
 
+    // The bundled static YOLO export produces five unpacked float rows at 320px.
+    // Never index a malformed/empty tensor as successful empty-scene evidence.
+    if (out.empty() || out.dims != 2 || out.h != 5 || out.w != 2100
+            || out.elempack != 1 || out.elemsize != sizeof(float)) {
+        LOGE("invalid detector output shape");
+        return -4;
+    }
+
     std::vector<HeadBox> candidates;
     candidates.reserve(32);
 
@@ -269,6 +278,11 @@ int HeadDetector::detect(const unsigned char* rgba_pixels, int width, int height
 
     for (int i = 0; i < out.w; ++i) {
         float prob = ptr_conf[i];
+        if (!std::isfinite(prob) || prob < 0.0f || prob > 1.0f
+                || !std::isfinite(ptr_cx[i]) || !std::isfinite(ptr_cy[i])
+                || !std::isfinite(ptr_w[i]) || !std::isfinite(ptr_h[i])) {
+            return -4;
+        }
         if (prob < prob_threshold) continue;
 
         float bbox_cx = ptr_cx[i] * inv_w;

@@ -1,11 +1,10 @@
 import hashlib
 import os
+import re
 import shutil
 import sys
 import tempfile
 import threading
-import time
-import urllib.request
 
 from dalvik.system import DexClassLoader
 from elyx import assets
@@ -14,7 +13,7 @@ from java.lang import Float, Integer, String
 from java.util.function import Consumer
 from org.telegram.messenger import ApplicationLoader
 
-from .asset_hashes import ASSET_HASHES, MODEL_BIN_URL, MODEL_BIN_SHA256, MODEL_BIN_SIZE
+from .asset_hashes import ASSET_HASHES
 
 
 CLASS_NAME = "com.makey.blurfaces.g2.Main"
@@ -30,8 +29,9 @@ RUNTIME_BUNDLE_ID = hashlib.sha256((LOADER_ABI_SALT + "\0" + "".join(
         "dex/core.dex",
         "jni/arm64-v8a/libblur_faces.so",
         "model/head_det.param",
+        "model/head_det.bin",
     )
-) + MODEL_BIN_SHA256).encode("ascii")).hexdigest()
+)).encode("ascii")).hexdigest()
 _REGISTRY_KEY = "_blur_faces_ncnn_runtime_v3"
 _EPOCH_KEY = "_blur_faces_runtime_module_epoch"
 _MODULE_EPOCH = getattr(sys, _EPOCH_KEY, 0) + 1
@@ -142,6 +142,19 @@ def _stage_asset(asset_name, target, read_only):
     return target
 
 
+def _purge_legacy_debug_frames(directory):
+    """Remove only JPEG captures produced by older Blur Faces releases."""
+    if not os.path.isdir(directory) or os.path.islink(directory):
+        return
+    for name in os.listdir(directory):
+        if re.fullmatch(r"frame_\d+_c-?\d+_s-?\d+_y-?\d+\.jpg", name):
+            path = os.path.join(directory, name)
+            if os.path.isfile(path) and not os.path.islink(path):
+                os.unlink(path)
+    if not os.listdir(directory):
+        os.rmdir(directory)
+
+
 def _loaded_runtime_matches(registry):
     runtime_dir = registry.get("runtime_dir")
     if not runtime_dir:
@@ -172,71 +185,6 @@ def _release_loaded_core(registry):
     registry["methods"].clear()
 
 
-def _download_model_bin(target, logger=None):
-    expected = MODEL_BIN_SHA256
-    expected_size = MODEL_BIN_SIZE
-    url = MODEL_BIN_URL
-    os.makedirs(os.path.dirname(target), exist_ok=True)
-    if os.path.isfile(target) and _sha256(target) == expected:
-        try:
-            os.chmod(target, 0o444)
-        except OSError:
-            pass
-        return target
-
-    if logger:
-        logger(f"[BlurFaces] Downloading YOLOv8n head detector weights ({expected_size // 1024 // 1024} MB)...")
-
-    fd, temporary = tempfile.mkstemp(prefix="head_det.bin.", dir=os.path.dirname(target))
-    try:
-        req = urllib.request.Request(
-            url,
-            headers={"User-Agent": "Mozilla/5.0 (Android; Mobile; BlurFaces/1.0.0)"}
-        )
-        digest = hashlib.sha256()
-        downloaded = 0
-        last_log = time.time()
-        with os.fdopen(fd, "wb") as output, urllib.request.urlopen(req, timeout=45) as resp:
-            fd = None
-            while True:
-                chunk = resp.read(64 * 1024)
-                if not chunk:
-                    break
-                output.write(chunk)
-                digest.update(chunk)
-                downloaded += len(chunk)
-                now = time.time()
-                if logger and now - last_log >= 2.0:
-                    last_log = now
-                    pct = int(downloaded * 100 / expected_size) if expected_size > 0 else 0
-                    logger(f"[BlurFaces] Downloading model: {pct}% ({downloaded // 1024} KB)")
-            output.flush()
-            os.fsync(output.fileno())
-
-        if digest.hexdigest() != expected:
-            raise ValueError(f"Downloaded model SHA-256 mismatch: {digest.hexdigest()} vs {expected}")
-
-        os.replace(temporary, target)
-        try:
-            os.chmod(target, 0o444)
-        except OSError:
-            pass
-        if logger:
-            logger(f"[BlurFaces] Model weights verified and ready: {target}")
-        return target
-    finally:
-        if fd is not None:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-        if os.path.exists(temporary):
-            try:
-                os.unlink(temporary)
-            except OSError:
-                pass
-
-
 def _ensure_runtime_loaders(context, registry, logger=None):
     loaded_epoch = registry.get("module_epoch", 0)
     if loaded_epoch > _MODULE_EPOCH:
@@ -254,29 +202,18 @@ def _ensure_runtime_loaders(context, registry, logger=None):
         os.path.join(native_dir, "libblur_faces.so"), True,
     )
 
-    # Store model in the plugin's own folder so it is automatically removed upon plugin deletion
-    try:
-        param_asset = assets.get("model/head_det.param")
-        model_dir = os.path.dirname(param_asset.path_str) if param_asset else os.path.join(root, "models")
-    except Exception:
-        model_dir = os.path.join(root, "models")
-    os.makedirs(model_dir, exist_ok=True)
-
-    _download_model_bin(
-        os.path.join(model_dir, "head_det.bin"),
-        logger=logger,
-    )
-
-    # Clean legacy duplicate model files from app_blur_faces_runtime_v3 if present
-    legacy_model_dir = os.path.join(root, "models")
-    if os.path.isdir(legacy_model_dir):
-        try:
-            shutil.rmtree(legacy_model_dir)
-        except OSError:
-            pass
+    # Immutable, hashed model pair staged alongside this exact runtime bundle.
+    # Never write into Elyx's read-only asset tree or download replacement weights.
+    for name in (MODEL_FILENAME, BIN_FILENAME):
+        _stage_asset("model/" + name, os.path.join(runtime_dir, "model", name), True)
 
     opt = context.getDir("blur_faces_dex_opt_v3", 0).getCanonicalPath()
     parent = context.getClassLoader()
+
+    if (registry.get("core_loader") is not None
+            and registry.get("runtime_bundle_id") != RUNTIME_BUNDLE_ID):
+        registry["restart_reason"] = "Blur Faces native runtime or model changed while loaded"
+        raise RuntimeError(registry["restart_reason"] + "; restart the application")
 
     if (registry.get("core_loader") is not None
             and registry.get("core_bundle_id") == CORE_BUNDLE_ID):
@@ -302,25 +239,12 @@ def _ensure_runtime_loaders(context, registry, logger=None):
 
 def cached_model_path(context, logger=None):
     root = context.getDir("blur_faces_runtime_v3", 0).getCanonicalPath()
-    try:
-        param_asset = assets.get("model/head_det.param")
-        param_path = param_asset.path_str if param_asset else None
-    except Exception:
-        param_path = None
-    if not param_path or not os.path.isfile(param_path):
-        param_path = os.path.join(root, "models", "head_det.param")
-        if not os.path.isfile(param_path):
-            _stage_asset("model/head_det.param", param_path, True)
-
-    model_dir = os.path.dirname(param_path)
-    bin_path = os.path.join(model_dir, "head_det.bin")
-    if (os.path.isfile(param_path) and _sha256(param_path) == ASSET_HASHES["model/head_det.param"]
-            and os.path.isfile(bin_path) and _sha256(bin_path) == MODEL_BIN_SHA256):
-        return param_path
-    registry = _runtime_registry()
-    with registry["lock"]:
-        _ensure_runtime_loaders(context, registry, logger=logger)
-    return param_path if (os.path.isfile(param_path) and os.path.isfile(bin_path) and _sha256(bin_path) == MODEL_BIN_SHA256) else None
+    model_dir = os.path.join(root, "runtime_" + RUNTIME_BUNDLE_ID, "model")
+    # Verification and staging are independent of DexClassLoader and never use
+    # a network fallback. A missing/corrupt asset is an explicit startup failure.
+    for name in (MODEL_FILENAME, BIN_FILENAME):
+        _stage_asset("model/" + name, os.path.join(model_dir, name), True)
+    return os.path.join(model_dir, MODEL_FILENAME)
 
 
 def runtime_restart_reason():
@@ -346,6 +270,14 @@ class DexRuntime:
     def stage_and_start(self):
         try:
             context = ApplicationLoader.applicationContext
+            try:
+                try:
+                    files_dir = ApplicationLoader.getFilesDirFixed().getCanonicalPath()
+                except Exception:
+                    files_dir = context.getFilesDir().getCanonicalPath()
+                _purge_legacy_debug_frames(os.path.join(files_dir, "blurfaces_storage"))
+            except OSError as error:
+                self.plugin.log(f"[BlurFaces] Could not remove legacy debug captures: {error}")
             registry = _runtime_registry()
             with registry["lock"]:
                 _cancel_deferred_shutdown(registry)
@@ -369,10 +301,13 @@ class DexRuntime:
                 _method(registry, dex_class, "setMaskMode", String).invoke(None, str(self.mask_mode))
                 _method(registry, dex_class, "setBlurEnabled", String).invoke(
                     None, "true" if self.blur_by_default else "false")
+                # A reused Java core must not retain consent across Python reloads.
+                _method(registry, dex_class, "setDebugCapture", String, String).invoke(
+                    None, "false", RUNTIME_BUNDLE_ID)
 
             model_path = cached_model_path(context, logger=self.plugin.log if self.plugin else None)
             if model_path is None:
-                self.plugin.log("[BlurFaces] Model download or staging failed")
+                self.plugin.log("[BlurFaces] Bundled model staging failed")
                 return False
             self.plugin.log(
                 f"[BlurFaces] Active NCNN Head Detector model: {model_path}"
@@ -454,6 +389,27 @@ class DexRuntime:
             plugin = self.plugin
             if plugin is not None:
                 plugin.log(f"[BlurFaces] Blur state update failed: {error}")
+
+    def _debug_call(self, name, *arguments):
+        registry = _runtime_registry()
+        with registry["lock"]:
+            dex_class = self.dex_main_class
+            if dex_class is None or registry["owner"] is not self.owner_token:
+                raise RuntimeError("Debug capture runtime is not active")
+            return _method(registry, dex_class, name, *([String] * len(arguments))).invoke(
+                None, *arguments)
+
+    def set_debug_capture(self, enabled):
+        self._debug_call("setDebugCapture", "true" if enabled else "false", RUNTIME_BUNDLE_ID)
+
+    def is_debug_capture_enabled(self):
+        return bool(self._debug_call("isDebugCaptureEnabled"))
+
+    def get_debug_capture_status(self):
+        return str(self._debug_call("getDebugCaptureStatus"))
+
+    def clear_debug_captures(self):
+        return str(self._debug_call("clearDebugCaptures"))
 
     def run_privacy_self_test(self, mask_scale=None, mask_mode=None):
         if mask_scale is None:
@@ -549,6 +505,14 @@ class DexRuntime:
         registry = _runtime_registry()
         with registry["lock"]:
             if dex_class is not None and registry["owner"] is self.owner_token:
+                # Stop capture now, not after the deferred hook-shutdown grace period.
+                try:
+                    _method(registry, dex_class, "setDebugCapture", String, String).invoke(
+                        None, "false", RUNTIME_BUNDLE_ID)
+                except Exception as error:
+                    if self.plugin is not None:
+                        self.plugin.log(f"[BlurFaces] Debug stop failed: {error}")
+                    deferred = False
                 token = object()
                 registry["shutdown_token"] = token
                 def finish_shutdown():

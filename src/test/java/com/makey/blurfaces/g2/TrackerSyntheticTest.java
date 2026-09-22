@@ -1,7 +1,5 @@
 package com.makey.blurfaces.g2;
 
-import com.google.mediapipe.tasks.components.containers.NormalizedKeypoint;
-import com.google.mediapipe.tasks.components.containers.NormalizedLandmark;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
@@ -319,62 +317,28 @@ public class TrackerSyntheticTest {
         assertNull("Track slot must be cleanly cleared", tracker.tracks[0]);
     }
 
-    /**
-     * d) Confidence Hysteresis Test:
-     * - Detection with score 0.25 on empty tracker -> rejected (< 0.30 threshold).
-     * - Detection with score 0.35 on empty tracker -> accepted (>= 0.30 threshold).
-     * - Low-confidence detection (score 0.22) near an existing track -> track accepts and updates.
-     * - Sub-threshold (0.15) near existing track -> rejected (< 0.20 gated threshold).
-     * - Detection with score 0.25 far away when track 0 exists -> rejected (< TRACK_NEW_MIN_CONFIDENCE).
-     * - Detection with score 0.45 far away -> accepted, new track created.
-     */
+    /** Confidence hysteresis belongs to native ByteTrack, not this renderer. */
     @Test
-    public void testConfidenceHysteresis() {
-        Main.SourceTracks tracker = new Main.SourceTracks();
-        long t = 1_000_000_000L;
-
-        // 1. Detection with score 0.25 on empty tracker -> rejected (< 0.30 threshold)
-        tracker.update(makeSingleDetection(0.50f, 0.50f, 0.08f, 0.10f, 0.25f, t), t);
-        assertNull("Score 0.25 must not create a track on an empty tracker", tracker.tracks[0]);
-
-        // 2. Detection with score 0.35 on empty tracker -> accepted (>= 0.30 threshold)
-        t += DT_30FPS_NS;
-        long createdTime = t;
-        tracker.update(makeSingleDetection(0.50f, 0.50f, 0.08f, 0.10f, 0.35f, t), t);
-        assertNotNull("Score 0.35 must create a new track on empty tracker", tracker.tracks[0]);
-        assertEquals("Track center X", 0.50f, tracker.tracks[0].values[0], 0.001f);
-        assertEquals("Track last seen time", createdTime, tracker.tracks[0].lastSeenNanos);
-
-        // 3. Low-confidence detection (score 0.22) NEAR existing track (gate radius ~ 0.16)
-        // Center at (0.51, 0.51), dist^2 = 0.0002 <= gate^2
-        t += DT_30FPS_NS;
-        long updateTime = t;
-        tracker.update(makeSingleDetection(0.51f, 0.51f, 0.08f, 0.10f, 0.22f, t), t);
-        assertEquals("Existing track must be updated by gated 0.22 detection",
-                updateTime, tracker.tracks[0].lastSeenNanos);
-        assertNull("No secondary track created", tracker.tracks[1]);
-
-        // 4. Very low confidence detection (score 0.15) NEAR existing track
-        // Should be rejected because score < TRACK_GATED_MIN_CONFIDENCE (0.20)
-        t += DT_30FPS_NS;
-        tracker.update(makeSingleDetection(0.51f, 0.51f, 0.08f, 0.10f, 0.15f, t), t);
-        assertEquals("Track lastSeenNanos must NOT advance on sub-0.20 score",
-                updateTime, tracker.tracks[0].lastSeenNanos);
-
-        // 5. Detection with score 0.25 FAR away from track 0 (at 0.90, 0.90)
-        // Cannot match track 0 (outside gate), cannot create new track (0.25 < TRACK_NEW_MIN_CONFIDENCE 0.30)
-        t += DT_30FPS_NS;
-        tracker.update(makeSingleDetection(0.90f, 0.90f, 0.08f, 0.10f, 0.25f, t), t);
-        assertNull("Score 0.25 far away must not create track 1", tracker.tracks[1]);
-        assertEquals("Track 0 must not match distant detection", updateTime, tracker.tracks[0].lastSeenNanos);
-
-        // 6. Detection with score 0.45 FAR away (at 0.90, 0.90)
-        // Cannot match track 0, but score 0.45 >= 0.30 -> creates track 1
-        t += DT_30FPS_NS;
-        tracker.update(makeSingleDetection(0.90f, 0.90f, 0.08f, 0.10f, 0.45f, t), t);
-        assertNotNull("Score 0.50 far away must create track in slot 1", tracker.tracks[1]);
-        assertEquals("Slot 1 center X", 0.90f, tracker.tracks[1].values[0], 0.01f);
-        assertEquals("Slot 1 center Y", 0.90f, tracker.tracks[1].values[1], 0.01f);
+    public void testNativeConfirmedLowLightHeadsAreNotFilteredAgain() {
+        for (float configured : new float[]{.35f, .25f, .18f}) {
+            Main.configuredConfidence = configured;
+            Main.SourceTracks tracker = new Main.SourceTracks();
+            long t = 1_000_000_000L;
+            // Native confirmed a head below the configured daytime threshold.
+            tracker.update(makeSingleDetection(.50f, .50f, .08f, .10f, .15f, t), t);
+            assertNotNull("Native confirmation must create a mask", tracker.tracks[0]);
+            assertEquals(t, tracker.tracks[0].lastSeenNanos);
+            t += DT_30FPS_NS;
+            tracker.update(makeSingleDetection(.51f, .51f, .08f, .10f, .10f, t), t);
+            assertEquals("Native low-score continuation must update the mask", t,
+                    tracker.tracks[0].lastSeenNanos);
+            assertNull(tracker.tracks[1]);
+            t += DT_30FPS_NS;
+            tracker.update(makeSingleDetection(.90f, .90f, .08f, .10f, .15f, t), t);
+            assertNotNull("A second confirmed head also needs protection", tracker.tracks[1]);
+            assertEquals(.90f, tracker.tracks[1].values[0], .001f);
+            assertEquals(2, tracker.geometryAt(t, TEST_SOURCE).count);
+        }
     }
 
     /**
@@ -448,87 +412,37 @@ public class TrackerSyntheticTest {
         }
     }
 
-    /**
-     * f) Yaw Computation and Proactive Dilation:
-     * - Face Landmarker: computeMeshYaw with landmarks 1, 234, 454.
-     * - Verify frontal (yaw ~ 0), profile-left (yaw ~ +0.60), profile-right (yaw ~ -0.60).
-     * - Verify ovalPcaAffine inflates lateral radius and shifts center along yaw when |yaw| > 0.25.
-     * - Face Detector: computeBoxYaw with keypoints 0, 1, 2.
-     * - Verify box yaw detection for frontal and profile turns.
-     */
+    /** The native head detector replaced MediaPipe landmarks and does not infer yaw. */
     @Test
-    public void testYawDetectionAndAffineDilation() {
-        // 1. Face Landmarker yaw computation
-        List<NormalizedLandmark> mesh = new ArrayList<>(468);
-        for (int i = 0; i < 468; i++) {
-            mesh.add(NormalizedLandmark.create(0.5f, 0.5f, 0.0f));
+    public void testNativeErrorsInvalidateGeometryAndRecover() {
+        String source = "native-error";
+        long t = System.nanoTime();
+        Main.SOURCE_ACTIVE_SINCE.put(source, t);
+        Main.SourceTracks tracker = new Main.SourceTracks();
+        Main.SOURCE_TRACKS.put(source, tracker);
+        for (int status : new int[]{-1, -2, -3, -4, -5, Main.MAX_FACES + 1}) {
+            tracker.update(makeSingleDetection(.5f, .5f, .08f, .10f, .9f, t), t);
+            assertNotNull(tracker.geometryAt(t, source));
+            try {
+                tracker.update(new Main.FaceGeometry(new float[24], new float[4],
+                        new float[4], status, t + 1, source), t + 1);
+                org.junit.Assert.fail("Invalid status must fail: " + status);
+            } catch (IllegalArgumentException expected) { }
+            assertNull(tracker.geometryAt(t + 1, source));
+            assertFalse(Main.hasFreshResult(source, t + 1));
+            assertEquals(-1, Main.resolveFaceCount(source, t + 1));
+            assertEquals(0L, tracker.lastPublishedNanos);
+            // A real successful empty observation, unlike an error, may clear the frame.
+            tracker.update(new Main.FaceGeometry(new float[0], 0, t + 2, source), t + 2);
+            assertTrue(Main.hasFreshResult(source, t + 2));
+            assertEquals(0, Main.resolveFaceCount(source, t + 2));
+            t += 3;
         }
-        // Cheek landmarks 234 (right cheek, x=0.35) and 454 (left cheek, x=0.65)
-        mesh.set(234, NormalizedLandmark.create(0.35f, 0.50f, 0.0f));
-        mesh.set(454, NormalizedLandmark.create(0.65f, 0.50f, 0.0f));
-
-        // Frontal: nose at midpoint (0.50)
-        mesh.set(1, NormalizedLandmark.create(0.50f, 0.55f, 0.0f));
-        float yawFrontal = Main.computeMeshYaw(mesh);
-        assertEquals("Frontal face yaw must be 0.0", 0.0f, yawFrontal, 1e-4f);
-
-        // Turn left (+X): nose at 0.59 -> (0.59 - 0.50) / 0.15 = +0.60
-        mesh.set(1, NormalizedLandmark.create(0.59f, 0.55f, 0.0f));
-        float yawLeft = Main.computeMeshYaw(mesh);
-        assertEquals("Turned left face yaw must be +0.60", 0.60f, yawLeft, 1e-4f);
-
-        // Turn right (-X): nose at 0.41 -> (0.41 - 0.50) / 0.15 = -0.60
-        mesh.set(1, NormalizedLandmark.create(0.41f, 0.55f, 0.0f));
-        float yawRight = Main.computeMeshYaw(mesh);
-        assertEquals("Turned right face yaw must be -0.60", -0.60f, yawRight, 1e-4f);
-
-        // 2. ovalPcaAffine with yaw
-        // Create standard canonical oval landmarks centered at (0.5, 0.5)
-        int[] ovalIndices = new int[] { 10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288, 397,
-                365, 379, 378, 400, 377, 152, 148, 176, 149, 150, 136, 172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109 };
-        for (int i = 0; i < ovalIndices.length; i++) {
-            int idx = ovalIndices[i];
-            double angle = (i * 2.0 * Math.PI) / ovalIndices.length;
-            float ox = 0.50f + 0.15f * (float) Math.cos(angle);
-            float oy = 0.50f + 0.22f * (float) Math.sin(angle);
-            mesh.set(idx, NormalizedLandmark.create(ox, oy, 0.0f));
-        }
-        mesh.set(234, NormalizedLandmark.create(0.35f, 0.50f, 0.0f));
-        mesh.set(454, NormalizedLandmark.create(0.65f, 0.50f, 0.0f));
-
-        // Test frontal affine
-        float[] outFrontal = new float[Main.FACE_STRIDE];
-        boolean okFrontal = Main.ovalPcaAffine(mesh, outFrontal, 0, 0.0f);
-        assertTrue(okFrontal);
-
-        // Test turned left affine (|yaw| = 0.60 > 0.25)
-        float[] outTurned = new float[Main.FACE_STRIDE];
-        boolean okTurned = Main.ovalPcaAffine(mesh, outTurned, 0, yawLeft);
-        assertTrue(okTurned);
-
-        // Lateral radius in outTurned must be expanded compared to frontal
-        float frontalLateral = Math.min(Main.axisLength(outFrontal, 2), Main.axisLength(outFrontal, 4));
-        float turnedLateral = Math.min(Main.axisLength(outTurned, 2), Main.axisLength(outTurned, 4));
-        assertTrue("Turned face lateral mask radius (" + turnedLateral + ") must be inflated compared to frontal (" + frontalLateral + ")",
-                turnedLateral > frontalLateral);
-
-        // Center must be shifted towards yaw direction (+X)
-        assertTrue("Turned face center X (" + outTurned[0] + ") must be shifted towards yaw from frontal (" + outFrontal[0] + ")",
-                outTurned[0] > outFrontal[0]);
-
-        // 3. Face Detector keypoint yaw computation
-        List<NormalizedKeypoint> kps = new ArrayList<>();
-        kps.add(NormalizedKeypoint.create(0.40f, 0.40f)); // left / right eye
-        kps.add(NormalizedKeypoint.create(0.60f, 0.40f)); // right / left eye
-        kps.add(NormalizedKeypoint.create(0.50f, 0.50f)); // nose tip
-
-        float boxYawFrontal = Main.computeBoxYaw(kps);
-        assertEquals("Frontal box yaw must be 0.0", 0.0f, boxYawFrontal, 1e-4f);
-
-        // Nose turned right in image (+X): x = 0.56
-        kps.set(2, NormalizedKeypoint.create(0.56f, 0.50f));
-        float boxYawTurned = Main.computeBoxYaw(kps);
-        assertEquals("Turned box yaw must be +0.60", 0.60f, boxYawTurned, 1e-4f);
+        // Java exceptions invalidate a previously successful publication as well.
+        Main.invalidateResult(source);
+        assertEquals(-1, Main.resolveFaceCount(source, t));
+        Main.SOURCE_TRACKS.remove(source);
+        Main.SOURCE_ACTIVE_SINCE.remove(source);
     }
 
     /**
@@ -593,80 +507,28 @@ public class TrackerSyntheticTest {
      */
     @Test
     public void testYawRobustnessAndEdgeCases() {
-        // 1. computeMeshYaw edge cases
-        assertEquals(0.0f, Main.computeMeshYaw(null), 1e-6f);
-        assertEquals(0.0f, Main.computeMeshYaw(new ArrayList<>()), 1e-6f);
-
-        List<NormalizedLandmark> shortMesh = new ArrayList<>();
-        for (int i = 0; i < 454; i++) shortMesh.add(NormalizedLandmark.create(0.5f, 0.5f, 0.0f));
-        assertEquals("Mesh size 454 (< 455) must return 0.0", 0.0f, Main.computeMeshYaw(shortMesh), 1e-6f);
-
-        List<NormalizedLandmark> validMesh = new ArrayList<>(468);
-        for (int i = 0; i < 468; i++) validMesh.add(NormalizedLandmark.create(0.5f, 0.5f, 0.0f));
-
-        // spanX near 0 (dx <= 1e-4f)
-        validMesh.set(234, NormalizedLandmark.create(0.50001f, 0.5f, 0.0f));
-        validMesh.set(454, NormalizedLandmark.create(0.50002f, 0.5f, 0.0f));
-        validMesh.set(1, NormalizedLandmark.create(0.55f, 0.5f, 0.0f));
-        assertEquals("SpanX near zero must return 0.0", 0.0f, Main.computeMeshYaw(validMesh), 1e-6f);
-
-        // NaN coordinates
-        validMesh.set(234, NormalizedLandmark.create(0.35f, 0.5f, 0.0f));
-        validMesh.set(454, NormalizedLandmark.create(0.65f, 0.5f, 0.0f));
-        validMesh.set(1, NormalizedLandmark.create(Float.NaN, 0.5f, 0.0f));
-        assertEquals("NaN nose coordinate must return 0.0", 0.0f, Main.computeMeshYaw(validMesh), 1e-6f);
-
-        validMesh.set(234, NormalizedLandmark.create(Float.NaN, 0.5f, 0.0f));
-        assertEquals("NaN cheek coordinate must return 0.0", 0.0f, Main.computeMeshYaw(validMesh), 1e-6f);
-
-        // 2. computeBoxYaw edge cases
-        assertEquals(0.0f, Main.computeBoxYaw(null), 1e-6f);
-        assertEquals(0.0f, Main.computeBoxYaw(new ArrayList<>()), 1e-6f);
-
-        List<NormalizedKeypoint> kps1 = new ArrayList<>();
-        kps1.add(NormalizedKeypoint.create(0.4f, 0.4f));
-        assertEquals(0.0f, Main.computeBoxYaw(kps1), 1e-6f);
-
-        List<NormalizedKeypoint> kps2 = new ArrayList<>();
-        kps2.add(NormalizedKeypoint.create(0.4f, 0.4f));
-        kps2.add(NormalizedKeypoint.create(0.6f, 0.4f));
-        assertEquals(0.0f, Main.computeBoxYaw(kps2), 1e-6f);
-
-        // eyeSpan near 0
-        List<NormalizedKeypoint> kps3 = new ArrayList<>();
-        kps3.add(NormalizedKeypoint.create(0.50001f, 0.4f));
-        kps3.add(NormalizedKeypoint.create(0.50002f, 0.4f));
-        kps3.add(NormalizedKeypoint.create(0.55f, 0.5f));
-        assertEquals("EyeSpan near zero must return 0.0", 0.0f, Main.computeBoxYaw(kps3), 1e-6f);
-
-        // NaN coordinates
-        List<NormalizedKeypoint> kpsNaN = new ArrayList<>();
-        kpsNaN.add(NormalizedKeypoint.create(0.4f, 0.4f));
-        kpsNaN.add(NormalizedKeypoint.create(0.6f, 0.4f));
-        kpsNaN.add(NormalizedKeypoint.create(Float.NaN, 0.5f));
-        assertEquals("NaN keypoint must return 0.0", 0.0f, Main.computeBoxYaw(kpsNaN), 1e-6f);
-
-        // 3. meshToGeometry skips corrupted mesh without aborting subsequent valid meshes
-        List<List<NormalizedLandmark>> meshes = new ArrayList<>();
-        meshes.add(shortMesh); // corrupt / short mesh (< 455)
-        List<NormalizedLandmark> face2 = new ArrayList<>(468);
-        for (int i = 0; i < 468; i++) face2.add(NormalizedLandmark.create(0.5f, 0.5f, 0.0f));
-        int[] ovalIndices = new int[] { 10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288, 397,
-                365, 379, 378, 400, 377, 152, 148, 176, 149, 150, 136, 172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109 };
-        for (int i = 0; i < ovalIndices.length; i++) {
-            int idx = ovalIndices[i];
-            double angle = (i * 2.0 * Math.PI) / ovalIndices.length;
-            face2.set(idx, NormalizedLandmark.create(0.50f + 0.15f * (float) Math.cos(angle),
-                                                    0.50f + 0.22f * (float) Math.sin(angle), 0.0f));
+        // The JNI boundary replaces the retired landmark decoder. Malformed
+        // geometry invalidates the entire result rather than exposing one face.
+        assertFalse(Main.validNativeResult(null));
+        Main.FaceGeometry valid = makeSingleDetection(.5f, .5f, .1f, .1f, .9f, 1L);
+        assertTrue(Main.validNativeResult(valid));
+        for (int i = 0; i < Main.FACE_STRIDE; i++) {
+            float saved = valid.faces[i];
+            for (float bad : new float[]{Float.NaN, Float.POSITIVE_INFINITY, Float.NEGATIVE_INFINITY}) {
+                valid.faces[i] = bad;
+                assertFalse(Main.validNativeResult(valid));
+            }
+            valid.faces[i] = saved;
         }
-        face2.set(234, NormalizedLandmark.create(0.35f, 0.50f, 0.0f));
-        face2.set(454, NormalizedLandmark.create(0.65f, 0.50f, 0.0f));
-        face2.set(1, NormalizedLandmark.create(0.59f, 0.55f, 0.0f));
-        meshes.add(face2);
-
-        Main.FaceGeometry geom = Main.meshToGeometry(meshes, 1_000_000_000L, TEST_SOURCE);
-        assertEquals("Should process valid face even when preceded by short mesh", 1, geom.count);
-        assertEquals(0.60f, geom.yaws[0], 1e-4f);
+        for (float score : new float[]{Float.NaN, Float.POSITIVE_INFINITY, -.1f, 1.1f}) {
+            valid.scores[0] = score;
+            assertFalse(Main.validNativeResult(valid));
+        }
+        valid.scores[0] = .9f;
+        valid.faces[2] = 0f;
+        assertFalse("Degenerate ellipse cannot cover a head", Main.validNativeResult(valid));
+        assertFalse(Main.validNativeResult(new Main.FaceGeometry(new float[5], new float[1], 1, 1L, TEST_SOURCE)));
+        assertFalse(Main.validNativeResult(new Main.FaceGeometry(new float[6], new float[0], 1, 1L, TEST_SOURCE)));
 
         // 4. FaceTrack NaN yaw resilience
         float[] det = new float[Main.FACE_STRIDE];
@@ -1176,8 +1038,9 @@ public class TrackerSyntheticTest {
                 assertNotNull(result);
                 assertTrue("Self-test must pass for mode " + mode + " scale " + scale + " but was: " + result,
                         result.startsWith("PASSED:"));
-                assertTrue(result.contains("Face obliterated, contrast reduced by"));
-                assertTrue(result.contains("detector score < 0.15"));
+                assertTrue(result.contains("Synthetic CPU mask contrast reduced by"));
+                assertTrue(result.contains("detector, GPU and encoder not tested"));
+                assertFalse(result.contains("detector score"));
             }
         }
         // Also test zero/default parameters

@@ -1,5 +1,6 @@
 import threading
 
+from android_utils import run_on_ui_thread
 from base_plugin import BasePlugin
 from client_utils import run_on_queue
 from elyx import strings
@@ -26,11 +27,19 @@ class BlurFacesPlugin(BasePlugin):
         self._generation = 0
         self._config_generation = 0
         self._loaded = False
+        self._debug_request = 0
+        self._debug_enabled = False
+        self._debug_status = "state=off"
 
     def on_plugin_load(self):
         self.log("[BlurFaces] Plugin loading...")
         self._loaded = True
         self.enabled = True
+        # Persisted Switch state is display-only, never consent after a reload.
+        self._debug_request += 1
+        self._debug_enabled = False
+        self._debug_status = "state=off"
+        self.set_setting("debug_capture", False)
         self.blur_by_default = bool(self.get_setting("blur_by_default", True))
         self.round_video_width_index = 0
         self.detection_range_index = self._valid_range_index(
@@ -75,6 +84,9 @@ class BlurFacesPlugin(BasePlugin):
         self.log("[BlurFaces] Plugin unloading...")
         self._loaded = False
         self.enabled = False
+        self._debug_request += 1
+        self._debug_enabled = False
+        self.set_setting("debug_capture", False)
         self._generation += 1
         self._stop_runtime()
 
@@ -121,7 +133,85 @@ class BlurFacesPlugin(BasePlugin):
                 on_change=self._on_range_change,
             ),
             Divider(text=strings.get("settings_range_subtext")),
+            Header(text=strings.get("debug_header")),
+            Switch(
+                key="debug_capture",
+                text=strings.get("debug_capture"),
+                default=False,
+                on_change=self._on_debug_capture_change,
+            ),
+            Divider(text=strings.get("debug_warning")),
+            Text(
+                text=strings.get("debug_status"),
+                on_click=self._on_debug_status_click,
+            ),
+            Divider(text=self._debug_status),
+            Text(
+                text=strings.get("debug_clear"),
+                red=True,
+                on_click=self._on_debug_clear_click,
+            ),
         ]
+
+    def _debug_action(self, action=None, value=False, notify=False):
+        runtime = self.dex_loader
+        if runtime is None or not self._loaded:
+            self.set_setting("debug_capture", False, reload_settings=True)
+            self.show_toast(strings.get("debug_unavailable"))
+            return
+        self._debug_request += 1
+        request = self._debug_request
+        generation = self._generation
+
+        def current():
+            return (self._loaded and self._is_current(generation)
+                    and request == self._debug_request and runtime is self.dex_loader)
+
+        def apply():
+            if not current():
+                return
+            error = None
+            try:
+                if action == "configure":
+                    runtime.set_debug_capture(value)
+                elif action == "clear":
+                    runtime.clear_debug_captures()
+                enabled = runtime.is_debug_capture_enabled()
+                status = runtime.get_debug_capture_status()
+            except Exception as exc:
+                error = str(exc)
+                try:
+                    runtime.set_debug_capture(False)
+                except Exception as stop_error:
+                    self.log(f"[BlurFaces] Debug stop after error failed: {stop_error}")
+                enabled = False
+                status = f"state=error: {error}"
+                self.log(f"[BlurFaces] Debug capture: {error}")
+
+            def publish():
+                if not current():
+                    return
+                self._debug_enabled = enabled
+                self._debug_status = status
+                self.set_setting("debug_capture", enabled, reload_settings=True)
+                if notify or error:
+                    self.show_toast(status)
+                if enabled:
+                    # Poll off the UI thread, including expiry with the camera closed.
+                    run_on_ui_thread(lambda: self._debug_action() if current() else None, 1000)
+
+            run_on_ui_thread(publish)
+
+        run_on_queue(apply)
+
+    def _on_debug_capture_change(self, value):
+        self._debug_action("configure", bool(value))
+
+    def _on_debug_status_click(self, _view=None):
+        self._debug_action(notify=True)
+
+    def _on_debug_clear_click(self, _view=None):
+        self._debug_action("clear", notify=True)
 
     @staticmethod
     def _valid_width_index(value):
@@ -218,7 +308,7 @@ class BlurFacesPlugin(BasePlugin):
         ).start()
 
     def _on_self_test_click(self, _view=None):
-        mask_scale = FACE_MASK_SCALES[self.face_mask_index] / 100.0
+        mask_scale = FACE_MASK_SCALE / 100.0
         mask_mode = self.mask_mode_index
         runtime = self.dex_loader
         result = None
@@ -232,7 +322,7 @@ class BlurFacesPlugin(BasePlugin):
                 temp_runtime = DexRuntime(
                     plugin=self,
                     round_video_width=ROUND_VIDEO_WIDTHS[self.round_video_width_index],
-                    face_mask_scale=FACE_MASK_SCALES[self.face_mask_index],
+                    face_mask_scale=FACE_MASK_SCALE,
                     detection_confidence=DETECTION_CONFIDENCES[self.detection_range_index],
                 )
                 if hasattr(temp_runtime, "run_privacy_self_test"):

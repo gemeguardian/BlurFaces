@@ -12,6 +12,7 @@ MANDATORY = {
     "dex/core.dex": ROOT / "build/dex/core.dex",
     "jni/arm64-v8a/libblur_faces.so": ROOT / "libs/arm64-v8a/libblur_faces.so",
     "model/head_det.param": ROOT / "models/head_det.param",
+    "model/head_det.bin": ROOT / "models/head_det.bin",
 }
 
 
@@ -42,7 +43,7 @@ for source_path in python_files:
         and any(isinstance(base, ast.Name) and base.id == "BasePlugin" for base in node.bases)
     )
 assert len(classes) == 1
-assert not any("storage.googleapis.com" in url for url in all_urls)
+assert not all_urls, "The runtime must not contain download endpoints"
 
 main_source = (TREE / "main.py").read_text(encoding="utf-8")
 runtime_source = (TREE / "runtime.py").read_text(encoding="utf-8")
@@ -69,7 +70,10 @@ assert 'getMethod("setLogger", consumer_type).invoke(None, None)' not in runtime
 assert "delete_model" not in runtime_source
 assert "is_model_downloaded" not in runtime_source
 assert "switch_model" not in runtime_source
-assert "_download_model_bin" in runtime_source
+assert "_download_model_bin" not in runtime_source
+assert "urllib" not in runtime_source
+assert "MODEL_BIN_URL" not in runtime_source
+assert "model/head_det.bin" in runtime_source
 assert "ModelSettingsBridge" in bridge_source
 assert "ModelRadioCell extends FrameLayout" in bridge_source
 assert "CustomSetting.Factory<ModelRadioCell>" in bridge_source
@@ -103,13 +107,14 @@ hash_namespace = {}
 exec((TREE / "asset_hashes.py").read_text(encoding="ascii"), hash_namespace)
 expected_hashes = hash_namespace["ASSET_HASHES"]
 assert set(expected_hashes) == set(MANDATORY)
-assert len(MANDATORY) == 3
+assert len(MANDATORY) == 4
 for name, generated in MANDATORY.items():
     bundled = TREE / "assets" / name
     assert bundled.read_bytes() == generated.read_bytes()
     assert digest(bundled.read_bytes()) == expected_hashes[name]
 
 artifacts = sorted((ROOT / "builds").glob("blur_faces-1.0.0*.elyx"), key=lambda path: path.stat().st_mtime_ns)
+assert artifacts, "Build the installable .elyx before running the packaging contract"
 if artifacts:
     artifact = artifacts[-1]
     with zipfile.ZipFile(artifact) as archive:
@@ -120,7 +125,7 @@ if artifacts:
         assert not any(".gradle" in name or name.startswith("build/") or name.startswith("src/") for name in entries)
         binary_entries = {
             name for name in entries
-            if name.endswith((".dex", ".so", ".param"))
+            if name.endswith((".dex", ".so", ".param", ".bin"))
         }
         assert binary_entries == {"BlurFaces/assets/" + name for name in MANDATORY}
         for name, generated in MANDATORY.items():
@@ -128,6 +133,6 @@ if artifacts:
             payload = archive.read(entry)
             assert payload == generated.read_bytes()
             assert digest(payload) == expected_hashes[name]
-    print(f"PASS: archive has native runtime and verified on-demand NCNN head detector: {artifact}")
-else:
-    print("PASS: static checks passed; ready for ElyxBuilder packaging")
+        for source in python_files:
+            assert archive.read("BlurFaces/" + source.name) == source.read_bytes()
+    print(f"PASS: archive contains current Python, DEX, ELF and both hashed offline NCNN model files: {artifact}")

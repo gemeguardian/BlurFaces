@@ -1,6 +1,28 @@
-# Blur Faces v3.0.0 Architecture & Handoff
+# Blur Faces 1.0.0 — Current Handoff
 
-Updated: 2026-09-20
+Updated: 2026-09-21
+
+## Current implementation
+
+The release version comes from `BlurFaces/metainfo.yml`: **1.0.0**. The old v3 label referred to development architecture, not the current release artifact.
+
+- `head_detector.cpp`: YOLOv8n, 320×320 RGB, NCNN CPU with **two** threads. Luma CLAHE/EMA in low light, normalized input, a validated 5×2100 float output, geometry guards and NMS. The old MobileNet skin/hemoglobin/anchor filters below are no longer implemented.
+- `bytetrack.cpp`: native confirmation and low-score association. `detection_result.h` preserves inference errors and rejects output exceeding the four-mask renderer capacity rather than truncating heads.
+- `Main.java`: hooks round-camera preview and encoder; validates native results before publication. Failures invalidate Java geometry and freshness, forcing full-frame protection until recovery. Java smoothing accepts all valid native-confirmed heads without reapplying confidence thresholds. Optical flow and bounded prediction remain.
+- Camera switches reset PBOs, queues and native/Java tracks; results captured before the switch are checked again after inference. The current barrier constant is **three frames**, not the historical one-frame claim. Its duration is device-dependent.
+- `runtime.py`: stages four bundled assets with SHA-256 checks into app-private runtime directories. No model downloads and no asset-tree writes. Changed native/model bundles require an app restart if a core is already loaded.
+- Debug capture is opt-in via Python settings, never restored on reload/restart, expires after five minutes (checked on sampling/status). A bounded single writer saves up to two samples/s into app-private no-backup storage: raw top-left RGBA, candidate/native-track JPEG crops and JSON including read-only Java track state. Limit: 300 files / 32 MiB; old samples are pruned after 24h on configuration/startup; a UI action stops capture and deletes owned files. No uploads. These are not final shader/encoder masks. At startup, legacy captures matching the old filename format are also removed; unrelated files/symlinks are preserved.
+- Settings: default blur, mask mode and sensitivity **35/25/18%**. Mask scale is **100%**, resolution is host-selected. The internal synthetic CPU self-test makes no claim to run NCNN, GPU shaders or the encoder.
+
+## Verification and remaining work
+
+See [README](README.md) for build/test commands and their scope. Packaging verifies DEX, ELF, both NCNN files and current Python source. JVM tests execute current Java code; host-native tests execute ByteTrack/result policy with UBSan. These do **not** verify Android hook compatibility, actual NCNN recall/latency or encoded video privacy.
+
+[Device validation](DEVICE_VALIDATION.md) is required before release. Treat startup/asset/hook failures as unavailable protection, not as a protected camera. No detector can guarantee zero missed heads.
+
+## Historical snapshot — not current behavior or verified measurements
+
+The remainder records the 2026-09-20 design. Its latency, one-frame switching, UI, filter and v3 artifact claims are obsolete/unverified; use the current summary above instead.
 
 ## Overview
 

@@ -11,6 +11,8 @@
 #include "blur_faces.h"
 #include "head_detector.h"
 #include "bytetrack.h"
+#include "detection_result.h"
+#include "debug_snapshot.h"
 
 #define TAG "BlurFaces"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
@@ -80,13 +82,16 @@ Java_com_makey_blurfaces_g2_NativeBridge_init(JNIEnv* env, jclass,
     return result;
 }
 
-extern "C" JNIEXPORT jint JNICALL
-Java_com_makey_blurfaces_g2_NativeBridge_process(JNIEnv* env, jclass,
-                                                 jobject rgba_buf, jint width, jint height,
-                                                 jfloatArray out_geom, jfloatArray out_scores,
-                                                 jfloatArray out_yaws, jint max_faces,
-                                                 jfloat min_confidence) {
-    if (!rgba_buf || width <= 0 || height <= 0 || max_faces <= 0) return -2;
+static jint process_frame(JNIEnv* env, jobject rgba_buf, jint width, jint height,
+                          jfloatArray out_geom, jfloatArray out_scores,
+                          jfloatArray out_yaws, jint max_faces,
+                          jfloat min_confidence, jfloatArray debug) {
+    if (debug && env->GetArrayLength(debug) < kDebugFloats) return -2;
+    if (!rgba_buf || width <= 0 || height <= 0 || max_faces <= 0 || max_faces > 4
+            || !out_geom || env->GetArrayLength(out_geom) < max_faces * 6
+            || (out_scores && env->GetArrayLength(out_scores) < max_faces)
+            || (out_yaws && env->GetArrayLength(out_yaws) < max_faces)
+            || !std::isfinite(min_confidence)) return -2;
     auto* pixels = static_cast<unsigned char*>(env->GetDirectBufferAddress(rgba_buf));
     jlong capacity = env->GetDirectBufferCapacity(rgba_buf);
     const size_t required = static_cast<size_t>(width) * static_cast<size_t>(height) * 4u;
@@ -123,12 +128,18 @@ Java_com_makey_blurfaces_g2_NativeBridge_process(JNIEnv* env, jclass,
 
     // Run NCNN Head Detection with low_thresh as detection floor
     std::vector<HeadBox> detected_heads;
-    g_detector->detect(pixels, width, height, detected_heads, low_thresh, 0.45f);
+    int status = g_detector->detect(pixels, width, height, detected_heads, low_thresh, 0.45f);
 
-    // Update ByteTrack multi-object tracker (returns confirmed active and coasting tracks)
-    std::vector<STrack> active_tracks = g_tracker->update(detected_heads, high_thresh, low_thresh, instant_thresh);
-
-    int count = std::min(static_cast<int>(active_tracks.size()), max_faces);
+    // Preserve native failures all the way to Java's full-frame fallback.
+    std::vector<STrack> active_tracks;
+    int count = update_detection_result(status, detected_heads, *g_tracker,
+            high_thresh, low_thresh, instant_thresh, max_faces, active_tracks);
+    if (debug) {
+        auto snapshot = debug_snapshot(status, high_thresh, low_thresh, instant_thresh,
+                scene_lum, g_detector->last_mean_lum(), detected_heads, active_tracks);
+        env->SetFloatArrayRegion(debug, 0, kDebugFloats, snapshot.data());
+    }
+    if (count < 0) return count;
     if (count > 0 && out_geom) {
         std::vector<float> geom_buffer(count * 6);
         std::vector<float> score_buffer(count);
@@ -157,6 +168,21 @@ Java_com_makey_blurfaces_g2_NativeBridge_process(JNIEnv* env, jclass,
     }
 
     return count;
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_makey_blurfaces_g2_NativeBridge_process(JNIEnv* env, jclass,
+        jobject rgba, jint width, jint height, jfloatArray geom, jfloatArray scores,
+        jfloatArray yaws, jint max_faces, jfloat confidence) {
+    return process_frame(env, rgba, width, height, geom, scores, yaws, max_faces, confidence, nullptr);
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_makey_blurfaces_g2_NativeBridge_processDebug(JNIEnv* env, jclass,
+        jobject rgba, jint width, jint height, jfloatArray geom, jfloatArray scores,
+        jfloatArray yaws, jint max_faces, jfloat confidence, jfloatArray debug) {
+    if (!debug) return -2;
+    return process_frame(env, rgba, width, height, geom, scores, yaws, max_faces, confidence, debug);
 }
 
 extern "C" JNIEXPORT void JNICALL

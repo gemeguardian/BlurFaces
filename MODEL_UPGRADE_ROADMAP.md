@@ -1,7 +1,14 @@
-# Architectural Roadmap: Upgrading Head Detection Engine & Verification Pipeline
+# Historical Proposal: Head Detection Engine Upgrade
 
-Date: 2026-09-20  
-Project: `blur-faces` v3.0.0 (exteraGram / Telegram Android Privacy Plugin)
+Status reviewed: 2026-09-21. **YOLOv8 is already implemented.** This document is an archived proposal, not the active implementation checklist.
+
+Current release metadata is **1.0.0**. See [HANDOFF.md](HANDOFF.md) for the current architecture and [DEVICE_VALIDATION.md](DEVICE_VALIDATION.md) for the next steps: device measurements, regression footage and encoded-video inspection. A second classifier or another model replacement is not part of the current work.
+
+The original model accuracy/latency/size estimates and assertions such as “zero false positives” or “completely resolves” below were not validated for this plugin. Neither a presence classifier nor an anti-spoofing model guarantees recall or anonymity; additional rejection stages can hide real heads from the privacy mask. Do not use these estimates as release claims.
+
+---
+
+Original proposal date: 2026-09-20. The original v3.0.0 label is historical.
 
 ---
 
