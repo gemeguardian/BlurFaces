@@ -39,12 +39,21 @@ class LowLightAdaptiveContract(unittest.TestCase):
         self.assertIn("(Y[i] + 1.0f), 1.0f, 2.5f)", HEAD_CPP)
 
     def test_bytetrack_suppresses_transient_ghost_coasting(self):
-        self.assertIn("static constexpr int kMinHits = 3;", BYTE_H)
+        self.assertIn("static constexpr int kMinHits = 2;", BYTE_H)
         self.assertIn("static constexpr int kMinHitsForCoast = 6;", BYTE_H)
         self.assertIn("static constexpr int kMaxCoastPublishFrames = 4;", BYTE_H)
-        self.assertIn("frames_tracked() >= STrack::kMinHits", BYTE_CPP)
+        self.assertIn("trk.frames_tracked() >= STrack::kMinHits && trk.is_confirmed()", BYTE_CPP)
         self.assertIn("if (trk.publishable())", BYTE_CPP)
         self.assertNotIn("frames_lost() <= 12", BYTE_CPP)
+
+    def test_bytetrack_sprt_is_size_weighted_and_ignores_iou(self):
+        self.assertIn("static constexpr float kLogOddsConfirm = 1.5f;", BYTE_H)
+        self.assertIn("static constexpr float kEvidenceCap = 0.75f;", BYTE_H)
+        self.assertIn("static constexpr float kReliableArea = 0.03f;", BYTE_H)
+        self.assertIn("static constexpr float kMinSizeReliability = 0.35f;", BYTE_H)
+        self.assertIn("det.w * det.h >= STrack::kInstantMinArea", BYTE_CPP)
+        self.assertNotIn("delta_iou", BYTE_CPP)
+        self.assertIn("if (log_odds_ < 0.0f) return false;", BYTE_CPP)
 
     def test_main_calibrates_instant_and_low_thresholds(self):
         self.assertIn("low_thresh = std::max(0.12f, high_thresh * 0.55f)", MAIN_CPP)

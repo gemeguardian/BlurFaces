@@ -35,11 +35,13 @@ class STrack {
 public:
     STrack();
     STrack(const HeadBox& box, int track_id);
+    STrack(const HeadBox& box, int track_id, float neutral_score);
     ~STrack() = default;
 
     void predict();
     void update(const HeadBox& box, int frame_id);
     void update(const HeadBox& box, int frame_id, float iou);
+    void update(const HeadBox& box, int frame_id, float iou, float neutral_score);
     void mark_lost();
     void mark_removed();
     void activate(int frame_id);
@@ -62,15 +64,35 @@ public:
     HeadBox current_box() const;
     void get_geometry(float* out6) const;
 
-    static constexpr float kLogOddsConfirm = 1.0f; // ~73% posterior confidence
+    // Sequential Probability Ratio Test (SPRT) confirmation.
+    //
+    // Every observation adds evidence = logit(score) - logit(neutral), where
+    // neutral is the midpoint of the tracker's low/high thresholds, so scores at
+    // the band centre are uninformative, high scores count for, low scores count
+    // against. The per-frame contribution is capped, so no single frame confirms
+    // a track on its own, and scaled by size reliability: at 192 px capture a
+    // 10%-wide head is ~19 px, where YOLOv8n is least trustworthy (device trace
+    // 2026-09-22: a backpack scored 0.71/0.45/0.42 in a 10%x9% box), so tiny
+    // boxes must persist several times longer than large ones.
+    //
+    // Effect at neutral 0.27 (Normal preset, daylight): a selfie head at 0.76
+    // confirms in 2 frames; a 10%x20% head at 0.9 needs 3; a 0.45 candidate of
+    // reliable size needs 4; the backpack trace above (0.71, 0.45, then a run
+    // of ~0.42) never confirms.
+    static constexpr float kLogOddsConfirm = 1.5f;
     static constexpr float kLogOddsMin = -3.0f;
-    static constexpr float kLogOddsMax = 8.0f;
+    static constexpr float kLogOddsMax = 6.0f;
+    static constexpr float kEvidenceCap = 0.75f;
+    static constexpr float kReliableArea = 0.03f;   // ~17% x 17% of the frame
+    static constexpr float kMinSizeReliability = 0.35f;
+    static float evidence(const HeadBox& box, float neutral_score);
 
-    // Temporal confirmation policy. On-device evidence (2026-09-22, rear camera,
-    // empty room): YOLOv8n fires at 0.4-0.6 on clutter for one or two frames, so a
-    // head must be seen in kMinHits consecutive detector frames (>= high_thresh)
-    // before it is published, unless a single frame is unambiguous (instant).
-    static constexpr int kMinHits = 3;
+    // Single-frame (instant) activation is reserved for boxes large enough for
+    // the detector to be reliable; small boxes always go through SPRT.
+    static constexpr float kInstantMinArea = kReliableArea;
+
+    // Hit-count floor on top of SPRT; the evidence cap already guarantees >= 2.
+    static constexpr int kMinHits = 2;
     // Lost tracks are only coasted to the renderer when they were observed long
     // enough to be trusted, and only briefly: the detector runs at ~7-8 fps on
     // device, so every coasted frame costs ~130 ms of ghost blur. The Java layer

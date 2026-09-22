@@ -48,16 +48,31 @@ void KalmanState1D::update(float measurement, float r) {
 // STrack implementation
 STrack::STrack() : track_id_(0), state_(TrackState::New) {}
 
+namespace {
+constexpr float kDefaultNeutralScore = 0.35f;
+
+float logit(float p) {
+    p = std::clamp(p, 0.01f, 0.99f);
+    return std::log(p / (1.0f - p));
+}
+} // namespace
+
+float STrack::evidence(const HeadBox& box, float neutral_score) {
+    float raw = std::clamp(logit(box.score) - logit(neutral_score), -kEvidenceCap, kEvidenceCap);
+    float area = std::max(0.0f, box.w) * std::max(0.0f, box.h);
+    float reliability = std::clamp(area / kReliableArea, kMinSizeReliability, 1.0f);
+    return raw * reliability;
+}
+
 STrack::STrack(const HeadBox& box, int track_id)
+    : STrack(box, track_id, kDefaultNeutralScore) {}
+
+STrack::STrack(const HeadBox& box, int track_id, float neutral_score)
     : track_id_(track_id), state_(TrackState::New), frames_lost_(0),
       frames_tracked_(1), score_(box.score) {
     init_kalman(box);
-    // Wald Sequential Probability Ratio Test (SPRT) Log-Odds Initialization:
-    // L0 = logit(score) - logit(prior)
-    float p = std::clamp(box.score, 0.01f, 0.99f);
-    float logit_p = std::log(p / (1.0f - p));
-    constexpr float logit_prior = -0.6190f; // logit(0.35)
-    log_odds_ = std::clamp(logit_p - logit_prior, kLogOddsMin, kLogOddsMax);
+    // Wald SPRT log-odds initialisation from the first observation.
+    log_odds_ = std::clamp(evidence(box, neutral_score), kLogOddsMin, kLogOddsMax);
 }
 
 void STrack::init_kalman(const HeadBox& box) {
@@ -104,6 +119,11 @@ void STrack::update(const HeadBox& box, int frame_id) {
 }
 
 void STrack::update(const HeadBox& box, int frame_id, float iou) {
+    update(box, frame_id, iou, kDefaultNeutralScore);
+}
+
+void STrack::update(const HeadBox& box, int frame_id, float iou, float neutral_score) {
+    (void) iou; // spatial alignment is a tracking-quality signal, not head evidence
     float h = std::max(0.01f, box.h);
     float w = std::max(0.01f, box.w);
     float a = w / h;
@@ -130,17 +150,14 @@ void STrack::update(const HeadBox& box, int frame_id, float iou) {
     frames_tracked_++;
     score_ = box.score;
 
-    // Wald SPRT Bayesian Evidence Accumulation:
-    // 1. Evidence increment from detector confidence relative to neutral prior (s_neutral = 0.30)
-    float p = std::clamp(box.score, 0.01f, 0.99f);
-    float delta_score = std::log(p / (1.0f - p)) - (-0.8473f); // -ln(0.30/0.70)
-    // 2. Spatial alignment reward from Kalman IoU
-    float delta_iou = 1.2f * (iou - 0.40f);
-    // 3. Anthropometric shape deformation penalty: rigid human skulls don't deform >25% in 33ms
+    // Wald SPRT evidence accumulation (see bytetrack.h). A static object with a
+    // perfect IoU used to be rewarded here, which is exactly what a backpack is;
+    // only detector confidence (size-weighted) and shape rigidity count now.
+    float delta_score = evidence(box, neutral_score);
+    // Anthropometric shape deformation penalty: rigid human skulls don't deform >25% between frames
     float delta_deform = (deformation > 0.25f) ? (deformation - 0.25f) * 4.0f : 0.0f;
 
-    float delta_L = delta_score + delta_iou - delta_deform;
-    log_odds_ = std::clamp(log_odds_ + delta_L, kLogOddsMin, kLogOddsMax);
+    log_odds_ = std::clamp(log_odds_ + delta_score - delta_deform, kLogOddsMin, kLogOddsMax);
 }
 
 void STrack::activate(int frame_id) {
@@ -166,6 +183,9 @@ void STrack::mark_removed() {
 
 bool STrack::publishable() const {
     if (!is_activated_) return false;
+    // A confirmed track that has since been sustained only by below-neutral
+    // observations (or misses) has argued itself out of being a head.
+    if (log_odds_ < 0.0f) return false;
     if (state_ != TrackState::Lost) return true;
     return frames_tracked_ >= kMinHitsForCoast && frames_lost_ <= kMaxCoastPublishFrames;
 }
@@ -337,6 +357,9 @@ std::vector<STrack> ByteTracker::update(const std::vector<HeadBox>& detections) 
 std::vector<STrack> ByteTracker::update(const std::vector<HeadBox>& detections,
                                         float high_threshold, float low_threshold, float instant_threshold) {
     frame_id_++;
+    // SPRT neutral point: the centre of the tracker's confidence band. Scores
+    // above it are evidence for a head, below it against (see STrack::evidence).
+    const float neutral = 0.5f * (high_threshold + low_threshold);
 
     std::vector<HeadBox> det_first;
     std::vector<HeadBox> det_second;
@@ -369,7 +392,7 @@ std::vector<STrack> ByteTracker::update(const std::vector<HeadBox>& detections,
 
     for (const auto& match : matches_first) {
         float iou = 1.0f - iou_distance(tracked_stracks_[match.first].current_box(), det_first[match.second]);
-        tracked_stracks_[match.first].update(det_first[match.second], frame_id_, iou);
+        tracked_stracks_[match.first].update(det_first[match.second], frame_id_, iou, neutral);
     }
 
     // Step 2: Match low-score detections with remaining confirmed tracked tracks
@@ -386,7 +409,7 @@ std::vector<STrack> ByteTracker::update(const std::vector<HeadBox>& detections,
 
     for (const auto& match : matches_second) {
         float iou = 1.0f - iou_distance(remaining_tracked[match.first].current_box(), det_second[match.second]);
-        remaining_tracked[match.first].update(det_second[match.second], frame_id_, iou);
+        remaining_tracked[match.first].update(det_second[match.second], frame_id_, iou, neutral);
     }
 
     // Those still unmatched in step 2 become lost (coasting)
@@ -411,7 +434,7 @@ std::vector<STrack> ByteTracker::update(const std::vector<HeadBox>& detections,
     std::vector<STrack> reactivated_from_lost;
     for (const auto& match : matches_lost) {
         float iou = 1.0f - iou_distance(lost_stracks_[match.first].current_box(), rem_det_first[match.second]);
-        lost_stracks_[match.first].update(rem_det_first[match.second], frame_id_, iou);
+        lost_stracks_[match.first].update(rem_det_first[match.second], frame_id_, iou, neutral);
         reactivated_from_lost.push_back(lost_stracks_[match.first]);
     }
 
@@ -449,16 +472,18 @@ std::vector<STrack> ByteTracker::update(const std::vector<HeadBox>& detections,
     linear_assignment(rem_det_for_unconfirmed, unconfirmed_stracks_, match_thresh_,
                       matches_unconfirmed, unmatched_unconfirmed, unmatched_detections_final);
 
-    // A candidate must be re-detected at >= high_threshold in kMinHits consecutive
-    // detector frames before it is confirmed. One missed frame drops it: real heads
-    // are re-detected every frame, clutter is not.
+    // A candidate is confirmed once its accumulated SPRT evidence reaches
+    // kLogOddsConfirm (see bytetrack.h): confident, large heads confirm in two
+    // frames, borderline or tiny candidates need several consistent frames. It
+    // must be re-detected at >= high_threshold every frame meanwhile; one miss
+    // drops it, since real heads are re-detected every frame and clutter is not.
     std::vector<STrack> newly_confirmed;
     std::vector<STrack> still_unconfirmed;
     for (const auto& match : matches_unconfirmed) {
         STrack& trk = unconfirmed_stracks_[match.first];
         float iou = 1.0f - iou_distance(trk.current_box(), rem_det_for_unconfirmed[match.second]);
-        trk.update(rem_det_for_unconfirmed[match.second], frame_id_, iou);
-        if (trk.frames_tracked() >= STrack::kMinHits) {
+        trk.update(rem_det_for_unconfirmed[match.second], frame_id_, iou, neutral);
+        if (trk.frames_tracked() >= STrack::kMinHits && trk.is_confirmed()) {
             trk.activate(frame_id_);
             newly_confirmed.push_back(trk);
         } else {
@@ -473,14 +498,15 @@ std::vector<STrack> ByteTracker::update(const std::vector<HeadBox>& detections,
     std::vector<STrack> newly_spawned_instant;
     for (int idx : unmatched_detections_final) {
         const auto& det = rem_det_for_unconfirmed[idx];
-        if (det.score >= instant_threshold) {
-            // Unambiguous face: instant activation on first frame
-            STrack trk(det, next_track_id_++);
+        bool reliable_size = det.w * det.h >= STrack::kInstantMinArea;
+        if (det.score >= instant_threshold && reliable_size) {
+            // Unambiguous, large head: instant activation on first frame
+            STrack trk(det, next_track_id_++, neutral);
             trk.activate(frame_id_);
             newly_spawned_instant.push_back(trk);
         } else {
-            // Needs temporal confirmation in the next frame
-            STrack trk(det, next_track_id_++);
+            // Needs temporal confirmation over the next frames
+            STrack trk(det, next_track_id_++, neutral);
             unconfirmed_stracks_.push_back(trk);
         }
     }
