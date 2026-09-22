@@ -1944,9 +1944,12 @@ public final class Main {
         String prevSource = state.activeSource;
         state.activeSource = source;
         SOURCE_ACTIVE_SINCE.put(source, now);
-        if (prevSource != null) {
-            noteCameraSwitch(now);
-        }
+        // Reset on every source activation, not only on flips. The native ByteTracker
+        // ages lost tracks by detector frame count, not wall time, so without this a
+        // ghost track from a camera session closed a minute earlier survived into the
+        // next one and was re-identified with the first clutter detection (device
+        // logs 2026-09-22: "[Face #3]" spanning two sessions 54 s apart).
+        noteCameraSwitch(now);
         state.faceCount = -1;
         state.blurTexture = 0;
         java.util.Arrays.fill(state.faces, 0f);

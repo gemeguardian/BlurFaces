@@ -43,6 +43,9 @@ public:
     void mark_lost();
     void mark_removed();
     void activate(int frame_id);
+    // Whether the renderer may draw this track right now (confirmed, and if lost,
+    // trusted enough to coast).
+    bool publishable() const;
 
     int track_id() const { return track_id_; }
     TrackState state() const { return state_; }
@@ -62,6 +65,18 @@ public:
     static constexpr float kLogOddsConfirm = 1.0f; // ~73% posterior confidence
     static constexpr float kLogOddsMin = -3.0f;
     static constexpr float kLogOddsMax = 8.0f;
+
+    // Temporal confirmation policy. On-device evidence (2026-09-22, rear camera,
+    // empty room): YOLOv8n fires at 0.4-0.6 on clutter for one or two frames, so a
+    // head must be seen in kMinHits consecutive detector frames (>= high_thresh)
+    // before it is published, unless a single frame is unambiguous (instant).
+    static constexpr int kMinHits = 3;
+    // Lost tracks are only coasted to the renderer when they were observed long
+    // enough to be trusted, and only briefly: the detector runs at ~7-8 fps on
+    // device, so every coasted frame costs ~130 ms of ghost blur. The Java layer
+    // adds its own hold on top.
+    static constexpr int kMinHitsForCoast = 6;
+    static constexpr int kMaxCoastPublishFrames = 4;
 
 private:
     int track_id_ = 0;

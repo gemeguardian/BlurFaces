@@ -123,8 +123,9 @@ void STrack::update(const HeadBox& box, int frame_id, float iou) {
     kf_a_.update(a, 0.05f * 0.05f);
     kf_h_.update(h, r);
 
+    // An observation alone never confirms a track; only activate() does, once the
+    // temporal confirmation policy in ByteTracker::update is satisfied.
     state_ = TrackState::Tracked;
-    is_activated_ = true;
     frames_lost_ = 0;
     frames_tracked_++;
     score_ = box.score;
@@ -145,9 +146,10 @@ void STrack::update(const HeadBox& box, int frame_id, float iou) {
 void STrack::activate(int frame_id) {
     state_ = TrackState::Tracked;
     is_activated_ = true;
-    frames_tracked_ = 1;
+    // Keep the accumulated hit count: it feeds the coasting trust policy.
+    frames_tracked_ = std::max(1, frames_tracked_);
     frames_lost_ = 0;
-    // Boost log_odds to ensure confirmed state upon instant activation
+    // Boost log_odds to ensure confirmed state upon activation
     log_odds_ = std::max(log_odds_, kLogOddsConfirm + 0.5f);
 }
 
@@ -160,6 +162,12 @@ void STrack::mark_lost() {
 
 void STrack::mark_removed() {
     state_ = TrackState::Removed;
+}
+
+bool STrack::publishable() const {
+    if (!is_activated_) return false;
+    if (state_ != TrackState::Lost) return true;
+    return frames_tracked_ >= kMinHitsForCoast && frames_lost_ <= kMaxCoastPublishFrames;
 }
 
 float STrack::mahalanobis_distance_sq(const HeadBox& box) const {
@@ -407,20 +415,22 @@ std::vector<STrack> ByteTracker::update(const std::vector<HeadBox>& detections,
         reactivated_from_lost.push_back(lost_stracks_[match.first]);
     }
 
-    // Update lost tracks list: increment frames_lost for unmatched lost tracks
-    // Suppress persistent ghost blur for transient false positives:
-    // Tracks that were only observed for < 4 frames coast for at most 4 frames (~130ms)
-    // while established tracks (>= 4 frames) coast for up to max_time_lost_ (30 frames).
+    // Update lost tracks list: increment frames_lost for unmatched lost tracks.
+    // Suppress persistent ghost blur for transient false positives: tracks that
+    // were observed for fewer than kMinHitsForCoast frames are kept for
+    // re-identification for only 2 frames (and are never published while lost,
+    // see publishable()); established tracks coast up to max_time_lost_.
     std::vector<STrack> next_lost;
     for (int idx : unmatched_lost) {
         lost_stracks_[idx].mark_lost();
-        int allowed_lost = (lost_stracks_[idx].frames_tracked() >= 4) ? max_time_lost_ : 4;
+        int allowed_lost = (lost_stracks_[idx].frames_tracked() >= STrack::kMinHitsForCoast)
+                ? max_time_lost_ : 2;
         if (lost_stracks_[idx].frames_lost() <= allowed_lost) {
             next_lost.push_back(lost_stracks_[idx]);
         }
     }
     for (const auto& trk : newly_lost) {
-        int allowed_lost = (trk.frames_tracked() >= 4) ? max_time_lost_ : 4;
+        int allowed_lost = (trk.frames_tracked() >= STrack::kMinHitsForCoast) ? max_time_lost_ : 2;
         if (trk.frames_lost() <= allowed_lost) {
             next_lost.push_back(trk);
         }
@@ -439,16 +449,25 @@ std::vector<STrack> ByteTracker::update(const std::vector<HeadBox>& detections,
     linear_assignment(rem_det_for_unconfirmed, unconfirmed_stracks_, match_thresh_,
                       matches_unconfirmed, unmatched_unconfirmed, unmatched_detections_final);
 
+    // A candidate must be re-detected at >= high_threshold in kMinHits consecutive
+    // detector frames before it is confirmed. One missed frame drops it: real heads
+    // are re-detected every frame, clutter is not.
     std::vector<STrack> newly_confirmed;
+    std::vector<STrack> still_unconfirmed;
     for (const auto& match : matches_unconfirmed) {
-        float iou = 1.0f - iou_distance(unconfirmed_stracks_[match.first].current_box(), rem_det_for_unconfirmed[match.second]);
-        unconfirmed_stracks_[match.first].update(rem_det_for_unconfirmed[match.second], frame_id_, iou);
-        unconfirmed_stracks_[match.first].activate(frame_id_);
-        newly_confirmed.push_back(unconfirmed_stracks_[match.first]);
+        STrack& trk = unconfirmed_stracks_[match.first];
+        float iou = 1.0f - iou_distance(trk.current_box(), rem_det_for_unconfirmed[match.second]);
+        trk.update(rem_det_for_unconfirmed[match.second], frame_id_, iou);
+        if (trk.frames_tracked() >= STrack::kMinHits) {
+            trk.activate(frame_id_);
+            newly_confirmed.push_back(trk);
+        } else {
+            still_unconfirmed.push_back(trk);
+        }
     }
 
-    // Unmatched unconfirmed tracks are DROPPED! (transient 1-frame false positives eliminated)
-    unconfirmed_stracks_.clear();
+    // Unmatched unconfirmed tracks are DROPPED (transient false positives eliminated).
+    unconfirmed_stracks_ = still_unconfirmed;
 
     // Step 5: Process brand-new detections
     std::vector<STrack> newly_spawned_instant;
@@ -489,18 +508,18 @@ std::vector<STrack> ByteTracker::update(const std::vector<HeadBox>& detections,
     }
     tracked_stracks_ = next_tracked;
 
-    // Step 7: Output confirmed active tracks only (including coasting lost tracks)
+    // Step 7: Output confirmed active tracks, plus briefly coasted lost tracks that
+    // were observed long enough to be trusted (see STrack::publishable). The Java
+    // layer adds its own time-based hold, so native coasting stays short.
     std::vector<STrack> output_tracks;
     output_tracks.reserve(tracked_stracks_.size() + lost_stracks_.size());
     for (const auto& trk : tracked_stracks_) {
-        if (trk.is_activated()) {
+        if (trk.publishable()) {
             output_tracks.push_back(trk);
         }
     }
     for (const auto& trk : lost_stracks_) {
-        // Coast lost tracks with Kalman prediction for up to 12 frames (~380ms)
-        // to prevent blur flickering during momentary detector drops or head turns.
-        if (trk.is_activated() && trk.frames_lost() <= 12) {
+        if (trk.publishable()) {
             output_tracks.push_back(trk);
         }
     }

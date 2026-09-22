@@ -16,22 +16,21 @@ This document provides instructions for agents and developers working on the `bl
    - If the detector or tracking state is uninitialized or in transition (e.g. during a camera switch or startup), the frame must remain covered by blur.
    - Never show an unblurred frame if there is any chance a human face is present.
 
-3. **Sub-15ms Real-Time Performance**:
-   - Inference uses Tencent NCNN with ARM64 NEON SIMD optimizations.
-   - Frame readback uses asynchronous double-buffered OpenGL Pixel Buffer Objects (PBOs) in `CleanFrameTap.java` to prevent stalling the camera GL thread.
+3. **Real-Time Performance**:
+   - Inference uses Tencent NCNN (YOLOv8n head detector, 320x320 input, CPU, 2 threads) with ARM64 NEON SIMD optimizations.
+   - Frame readback uses asynchronous double-buffered OpenGL Pixel Buffer Objects (PBOs) in `CleanFrameTap.java` (192x192) to prevent stalling the camera GL thread.
+   - Measured on device (SM8750, 2026-09-22): 50–120 ms per inference, ~7–8 detector fps, 40–60% of captured frames dropped. Any tracker constant expressed in "frames" must be read against this cadence, not 30 fps.
 
-4. **Zero Lingering Blur on Camera Flip**:
-   - Camera switch barrier is 1 frame (~12ms).
-   - Any camera flip event must immediately invoke `noteCameraSwitch()` and `CleanFrameTap.resetPbo()` to flush pending async buffers.
+4. **Zero Lingering Blur on Camera Flip / New Session**:
+   - Camera switch barrier is `CAMERA_SWITCH_BARRIER_MIN_FRAMES` frames.
+   - `activateSource()` must call `noteCameraSwitch()` on **every** source activation (not only flips): it resets the native ByteTracker, whose lost tracks age by detector frame count rather than wall time, and calls `CleanFrameTap.resetPbo()` to flush pending async buffers.
 
-5. **Strict False-Positive Suppression**:
-   - The C++ engine in `src/head_detector.cpp` enforces:
-     * BT.601 skin chrominance locus check ($C_r \in [129, 178]$, $C_b \in [77, 130]$).
-     * Euclidean chrominance radius $\Delta_{\text{chroma}} \ge 2.85$ (rejects pants, denim, knees, office chairs).
-     * Non-biological yellow filter ($C_b < 75$, $R > 90$, $G > 70$) (rejects ceramic mugs and yellow objects).
-     * Spatial texture energy threshold $\ge 3.20$ (rejects blank walls, flat doors, cardboard).
-     * Deactivation of Feature 2 anchors (`feature_idx < 2`) (eliminates micro-clutter false positives).
-     * Biological hemoglobin balance ratio $(R - G) / (R - B) \ge 0.58$ and canine snout contrast gating (rejects dogs and pets).
+5. **False-Positive Suppression (current implementation)**:
+   - The detector is a learned model; there are no hand-written skin/texture/colour filters anymore (they were removed together with the anchor-based model in `f2f0187`). Do not re-document them without re-adding them.
+   - `src/head_detector.cpp` applies only geometric sanity gates on YOLO boxes: min size 5%, aspect 0.35–2.5, small-clutter (`w<0.11 || h<0.13` needs `prob>=0.38`), large-clutter (`area>0.35` needs `prob>=0.60`).
+   - Low-light CLAHE gain is capped at 2.5x; JNI relaxes only `high`/`low` thresholds in the dark, never `instant`.
+   - `src/bytetrack.cpp` provides the temporal suppression: a candidate needs `STrack::kMinHits` (3) consecutive detector frames at `>= high_thresh` before it is published, unless a single frame scores `>= instant_thresh` (floor 0.70). Lost tracks are coasted to the renderer only if they had `>= kMinHitsForCoast` (6) observations and for at most `kMaxCoastPublishFrames` (4) frames; the Java `SourceTracks` hold adds its own time-based coast on top.
+   - `tests/native_tracking_test.cpp` replays the false-positive traces recorded on device; keep it green when tuning thresholds.
 
 ## Repository Structure
 

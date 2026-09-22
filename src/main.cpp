@@ -108,22 +108,25 @@ static jint process_frame(JNIEnv* env, jobject rgba_buf, jint width, jint height
     if (min_conf <= 0.0f) min_conf = 0.35f;
     if (min_conf > 1.0f) min_conf /= 100.0f;
 
-    // high_thresh: threshold for high-confidence detections
-    // low_thresh: floor for ByteTrack stage 2 matching
-    // instant_thresh: threshold for single-frame instant activation
+    // high_thresh: threshold for high-confidence detections (needs kMinHits frames)
+    // low_thresh: floor for ByteTrack stage 2 matching of already-confirmed tracks
+    // instant_thresh: single-frame activation. Device logs (rear camera, empty
+    // room) show clutter scoring 0.41-0.61 for one or two frames, so a single
+    // frame is only trusted when the model is genuinely certain.
     float high_thresh = std::max(0.18f, std::min(0.50f, min_conf));
     float low_thresh = std::max(0.12f, high_thresh * 0.55f);
-    float instant_thresh = std::max(0.35f, std::min(0.60f, high_thresh + 0.05f));
+    float instant_thresh = std::max(0.70f, std::min(0.85f, high_thresh + 0.35f));
 
     // Low-light relaxation: model confidence physically drops in darkness, so
     // keeping daylight thresholds costs recall. Uses the previous frame's
-    // luminance (1-frame lag is irrelevant at 30 fps).
+    // luminance (1-frame lag is irrelevant at 30 fps). The CLAHE enhancement
+    // already amplifies noise in the same regime, so only the multi-frame
+    // thresholds are relaxed; single-frame instant activation never is.
     float scene_lum = g_detector->last_mean_lum();
     if (scene_lum < 45.0f) {
         float k = std::clamp((45.0f - scene_lum) / 35.0f, 0.0f, 1.0f);
-        high_thresh    = std::max(0.14f, high_thresh    * (1.0f - 0.35f * k));
-        low_thresh     = std::max(0.10f, low_thresh     * (1.0f - 0.35f * k));
-        instant_thresh = std::max(0.28f, instant_thresh * (1.0f - 0.30f * k));
+        high_thresh = std::max(0.14f, high_thresh * (1.0f - 0.35f * k));
+        low_thresh  = std::max(0.10f, low_thresh  * (1.0f - 0.35f * k));
     }
 
     // Run NCNN Head Detection with low_thresh as detection floor

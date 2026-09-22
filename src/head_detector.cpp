@@ -156,7 +156,9 @@ void HeadDetector::enhance_lowlight(ncnn::Mat& in, float t, float alpha) {
                      +         wy  * ((1.0f - wx) * map_[y1][x0][b1] + wx * map_[y1][x1][b1]);
             float v = (1.0f - wb) * v0 + wb * v1;
 
-            float gain = std::clamp((v + 1.0f) / (Y[i] + 1.0f), 1.0f, 4.0f);
+            // Gain ceiling 2.5x: 4x turned sensor noise into head-like texture on
+            // dark rear-camera scenes (false tracks at 0.4-0.5 confidence).
+            float gain = std::clamp((v + 1.0f) / (Y[i] + 1.0f), 1.0f, 2.5f);
             R[i] = std::min(R[i] * gain, 255.0f);
             G[i] = std::min(G[i] * gain, 255.0f);
             B[i] = std::min(B[i] * gain, 255.0f);
@@ -305,6 +307,11 @@ int HeadDetector::detect(const unsigned char* rgba_pixels, int width, int height
 
         // Small clutter discrimination
         if ((bw < 0.11f || bh < 0.13f) && prob < 0.38f) continue;
+
+        // Large clutter discrimination: a head covering more than a third of the
+        // frame is a close-up selfie, which the model scores highly. Device logs
+        // show 59%x74% boxes at 0.41-0.54 on an empty room instead.
+        if (bw * bh > 0.35f && prob < 0.60f) continue;
 
         // Aspect ratio [0.35, 2.50] supports all head tilts, profile turns, and full 360° poses
         float aspect = bw / bh;
