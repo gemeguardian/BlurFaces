@@ -12,7 +12,7 @@
 ![Code Size](https://img.shields.io/badge/code%20size-469%20KB%20%7C%2010.2k%20LoC-informational.svg)
 ![Bundle Size](https://img.shields.io/badge/bundle-7.4%20MB-purple.svg)
 
-[Возможности](#-возможности) · [Как это работает](#-как-это-работает) · [Установка](#-установка) · [Настройки](#%EF%B8%8F-настройки) · [Приватность](#-приватность-и-ограничения) · [Разработка](#%EF%B8%8F-разработка)
+[Возможности](#-возможности) · [Как это работает](#-как-это-работает) · [Установка](#-установка) · [Настройки](#%EF%B8%8F-настройки) · [Приватность](#-приватность-и-ограничения) · [Разработка](#%EF%B8%8F-разработка) · [Модель](#-модель-и-лицензии)
 
 </div>
 
@@ -166,6 +166,21 @@ tests/                  # тесты и контракты
 
 > [!IMPORTANT]
 > Перед релизом обязательна [проверка на телефоне](DEVICE_VALIDATION.md), включая покадровый просмотр **записанного** кружка. Одного превью недостаточно.
+
+## 🙏 Модель и лицензии
+
+Детектор голов `head_det.bin` / `head_det.param` — это NCNN-экспорт модели [**abhiWanKenobi/yolov8n_head_detection**](https://huggingface.co/abhiWanKenobi/yolov8n_head_detection) (код обучения: [AbhijithP96/yolo-head-detection](https://github.com/AbhijithP96/yolo-head-detection)). Модель переведена в формат NCNN (fp16, вход 320×320), обучением её не меняли.
+
+| Компонент | Автор | Лицензия |
+|---|---|---|
+| Веса YOLOv8n-Head | [abhiWanKenobi](https://huggingface.co/abhiWanKenobi) | [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/): только некоммерческое использование, с указанием автора |
+| Архитектура YOLOv8 | [Ultralytics](https://github.com/ultralytics/ultralytics) | [AGPL-3.0](https://www.gnu.org/licenses/agpl-3.0.html) |
+| Инференс | [Tencent NCNN](https://github.com/Tencent/ncnn) | BSD-3-Clause |
+
+Модель обучена на датасете **HollywoodHeads** (Vu, Osokin, Laptev. *Context-aware CNNs for person head detection*, ICCV 2015). Для оценки автор использовал **300W-LP** и **DAD-3DHeads**. Все эти датасеты предназначены только для исследований.
+
+> [!NOTE]
+> Из-за лицензии весов плагин нельзя продавать или распространять на коммерческих условиях. Для коммерческого использования нужна модель, обученная на данных с подходящей лицензией.
 
 ---
 
