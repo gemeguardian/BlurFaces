@@ -102,6 +102,27 @@ int main() {
     assert(output.front().track_id() == id);
     tracker.reset();
 
+    // max_time_lost is counted in detector frames (~7-8 fps on device, not 30):
+    // an established head is re-identified up to ~1 s of misses, and after that a
+    // re-detection is a fresh candidate that must earn confirmation again. With
+    // the upstream 30 it was re-identified and published straight away.
+    static_assert(ByteTracker::kMaxTimeLostFrames == 8, "test written for ~1 s at 7-8 fps");
+    for (int misses : {ByteTracker::kMaxTimeLostFrames, ByteTracker::kMaxTimeLostFrames + 1}) {
+        for (int i = 0; i < 8; ++i) process(1, {selfie(.5f, .55f)});
+        assert(process(1, {selfie(.5f, .55f)}) == 1);
+        int established = output.front().track_id();
+        for (int i = 0; i < misses; ++i) process(0, {});
+        if (misses <= ByteTracker::kMaxTimeLostFrames) {
+            assert(process(1, {selfie(.5f, .55f)}) == 1);
+            assert(output.front().track_id() == established);
+        } else {
+            assert(process(1, {selfie(.5f, .55f)}) == 0);
+            assert(process(1, {selfie(.5f, .55f)}) == 1);
+            assert(output.front().track_id() != established);
+        }
+        tracker.reset();
+    }
+
     std::vector<HeadBox> many(70, selfie(.5f, .9f));
     snapshot = debug_snapshot(70, .25f, .12f, .70f, 25.f, 25.f, many, {});
     assert(snapshot[7] == 70 && snapshot[8] == 64 && snapshot[9] == 0);

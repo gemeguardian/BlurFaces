@@ -195,5 +195,59 @@ public final class DebugCaptureDeviceTest {
         check(NativeBridge.processDebug(rgba, size, size, new float[24], new float[4],
                 new float[4], 4, .35f, new float[DebugCapture.SNAPSHOT_FLOATS]) == -1, "uninitialized native error");
         System.out.println("PASS: Android JPEG/JSON/ZIP, async buffer isolation, local store, NCNN debug ABI/parity at 0/128/255 luminance");
+        testResetDoesNotWaitForInference(root, rgba, size);
+    }
+
+    // NativeBridge.reset() is called from the camera GL thread and the UI thread on
+    // every camera flip / source activation. It must not wait for the inference
+    // worker, which holds the engine for a whole NCNN forward pass.
+    private static void testResetDoesNotWaitForInference(Path root, ByteBuffer rgba, int size)
+            throws Exception {
+        String param = root.resolve("head_det.param").toString();
+        String bin = root.resolve("head_det.bin").toString();
+        check(NativeBridge.init(param, bin) == 0, "native model init for reset latency");
+        final int frames = 60;
+        final int[] statuses = new int[frames];
+        final long[] inferenceNanos = new long[frames];
+        final java.util.concurrent.atomic.AtomicBoolean done = new java.util.concurrent.atomic.AtomicBoolean();
+        Thread worker = new Thread(() -> {
+            ByteBuffer local = rgba.duplicate();
+            for (int i = 0; i < frames; i++) {
+                local.position(0);
+                long start = System.nanoTime();
+                statuses[i] = NativeBridge.process(local, size, size, new float[24], new float[4],
+                        new float[4], 4, .35f);
+                inferenceNanos[i] = System.nanoTime() - start;
+            }
+            done.set(true);
+        }, "blur-faces-inference");
+        worker.start();
+        long[] resetNanos = new long[200];
+        int resets = 0;
+        java.util.Random random = new java.util.Random(7);
+        while (!done.get() && resets < resetNanos.length) {
+            Thread.sleep(5 + random.nextInt(40));
+            long start = System.nanoTime();
+            NativeBridge.reset();
+            resetNanos[resets++] = System.nanoTime() - start;
+        }
+        worker.join();
+        NativeBridge.cleanup();
+        check(resets > 10, "reset latency sample too small: " + resets);
+        long[] sortedReset = Arrays.copyOf(resetNanos, resets);
+        Arrays.sort(sortedReset);
+        long[] sortedInference = inferenceNanos.clone();
+        Arrays.sort(sortedInference);
+        int stale = 0;
+        for (int status : statuses) {
+            check(status >= 0 || status == -6, "unexpected native status during resets: " + status);
+            if (status == -6) stale++;
+        }
+        System.out.println(String.format(java.util.Locale.US,
+                "reset latency: n=%d p50=%.3fms max=%.3fms; inference p50=%.1fms max=%.1fms; stale results=%d/%d",
+                resets, sortedReset[resets / 2] / 1e6, sortedReset[resets - 1] / 1e6,
+                sortedInference[frames / 2] / 1e6, sortedInference[frames - 1] / 1e6, stale, frames));
+        check(sortedReset[resets - 1] < 2_000_000L, "reset() blocked behind inference");
+        System.out.println("PASS: NativeBridge.reset() never waits for an in-flight inference");
     }
 }

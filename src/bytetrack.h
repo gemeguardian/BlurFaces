@@ -120,10 +120,17 @@ private:
 
 class ByteTracker {
 public:
+    // How long an established lost track stays re-identifiable (it is published
+    // for at most STrack::kMaxCoastPublishFrames of these). Counted in detector
+    // frames, not camera frames: upstream ByteTrack's 30 assumes 30 fps, which at
+    // the measured 7-8 detector fps kept ghosts re-identifiable for ~4 s. 8 frames
+    // is the intended ~1 s.
+    static constexpr int kMaxTimeLostFrames = 8;
+
     ByteTracker(float high_threshold = 0.45f,
                 float low_threshold = 0.20f,
                 float match_threshold = 0.70f,
-                int max_time_lost = 30);
+                int max_time_lost = kMaxTimeLostFrames);
     ~ByteTracker() = default;
 
     // Updates tracks with new detections and returns active confirmed tracks for rendering

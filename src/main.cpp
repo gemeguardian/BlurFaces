@@ -1,6 +1,7 @@
 #include <jni.h>
 #include <android/log.h>
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -21,6 +22,19 @@
 static HeadDetector* g_detector = nullptr;
 static ByteTracker* g_tracker = nullptr;
 static std::mutex g_engine_mutex;
+
+// Tracker resets are requested from the camera GL thread and the UI thread on
+// every camera flip / source activation, while the inference worker holds
+// g_engine_mutex for a whole NCNN forward pass (50-120 ms on device). Taking the
+// mutex there stalled rendering, so a reset only bumps this generation; the
+// worker applies it before touching the tracker. g_tracker_generation is the
+// generation the tracker state belongs to and is guarded by g_engine_mutex.
+static std::atomic<uint32_t> g_reset_generation{0};
+static uint32_t g_tracker_generation = 0;
+
+// Detections from a frame whose inference overlapped a reset are dropped
+// without advancing the tracker. Negative, so Java never reads it as "no heads".
+static constexpr jint kStaleAfterReset = -6;
 
 static void allow_duplicate_openmp() {
     setenv("KMP_DUPLICATE_LIB_OK", "TRUE", 1);
@@ -46,7 +60,7 @@ int blur_faces_init(const char* param_path, const char* bin_path) {
     std::lock_guard<std::mutex> lock(g_engine_mutex);
     LOGI("Initializing HeadDetector and ByteTrack...");
     if (!g_detector) g_detector = new HeadDetector();
-    if (!g_tracker) g_tracker = new ByteTracker(0.45f, 0.20f, 0.70f, 30);
+    if (!g_tracker) g_tracker = new ByteTracker(0.45f, 0.20f, 0.70f, ByteTracker::kMaxTimeLostFrames);
 
     int ret = g_detector->load(param_path, bin_path);
     if (ret != 0) {
@@ -56,6 +70,7 @@ int blur_faces_init(const char* param_path, const char* bin_path) {
         return ret;
     }
     g_tracker->reset();
+    g_tracker_generation = g_reset_generation.load(std::memory_order_acquire);
     LOGI("HeadDetector + ByteTrack initialized successfully");
     return 0;
 }
@@ -102,6 +117,11 @@ static jint process_frame(JNIEnv* env, jobject rgba_buf, jint width, jint height
         LOGE("Engine not initialized");
         return -1;
     }
+    const uint32_t generation = g_reset_generation.load(std::memory_order_acquire);
+    if (generation != g_tracker_generation) {
+        g_tracker->reset();
+        g_tracker_generation = generation;
+    }
 
     // Map min_confidence to ByteTrack thresholds for YOLOv8
     float min_conf = static_cast<float>(min_confidence);
@@ -118,8 +138,9 @@ static jint process_frame(JNIEnv* env, jobject rgba_buf, jint width, jint height
     float instant_thresh = std::max(0.70f, std::min(0.85f, high_thresh + 0.35f));
 
     // Low-light relaxation: model confidence physically drops in darkness, so
-    // keeping daylight thresholds costs recall. Uses the previous frame's
-    // luminance (1-frame lag is irrelevant at 30 fps). The CLAHE enhancement
+    // keeping daylight thresholds costs recall. Uses the previous detector
+    // frame's luminance: ~130 ms old at the measured 7-8 detector fps, well
+    // inside the CLAHE hysteresis band and EMA smoothing. The CLAHE enhancement
     // already amplifies noise in the same regime, so only the multi-frame
     // thresholds are relaxed; single-frame instant activation never is.
     float scene_lum = g_detector->last_mean_lum();
@@ -132,6 +153,18 @@ static jint process_frame(JNIEnv* env, jobject rgba_buf, jint width, jint height
     // Run NCNN Head Detection with low_thresh as detection floor
     std::vector<HeadBox> detected_heads;
     int status = g_detector->detect(pixels, width, height, detected_heads, low_thresh, 0.45f);
+
+    // A reset arrived during inference: these detections belong to the previous
+    // camera/session and must not seed tracks in the new one. The next frame
+    // applies the reset; Java drops this result.
+    if (g_reset_generation.load(std::memory_order_acquire) != generation) {
+        if (debug) {
+            auto snapshot = debug_snapshot(kStaleAfterReset, high_thresh, low_thresh, instant_thresh,
+                    scene_lum, g_detector->last_mean_lum(), {}, {});
+            env->SetFloatArrayRegion(debug, 0, kDebugFloats, snapshot.data());
+        }
+        return kStaleAfterReset;
+    }
 
     // Preserve native failures all the way to Java's full-frame fallback.
     std::vector<STrack> active_tracks;
@@ -190,11 +223,8 @@ Java_com_makey_blurfaces_g2_NativeBridge_processDebug(JNIEnv* env, jclass,
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_makey_blurfaces_g2_NativeBridge_reset(JNIEnv*, jclass) {
-    std::lock_guard<std::mutex> lock(g_engine_mutex);
-    if (g_tracker) {
-        g_tracker->reset();
-        LOGI("ByteTracker reset on camera switch");
-    }
+    // Lock-free on purpose, see g_reset_generation.
+    g_reset_generation.fetch_add(1, std::memory_order_acq_rel);
 }
 
 extern "C" JNIEXPORT void JNICALL

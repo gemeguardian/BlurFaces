@@ -295,7 +295,10 @@ void ByteTracker::linear_assignment(const std::vector<HeadBox>& detections,
     }
 
     constexpr float kChiSquareGate = 20.0f; // df=4, p=0.001
-    constexpr float kMaxDeformation = 0.50f; // max physical head deformation in 33ms
+    // Max relative box size change between two detector frames (~130 ms apart at
+    // the measured 7-8 fps, not 33 ms): covers fast approach/retreat, rejects jumps
+    // onto an unrelated box.
+    constexpr float kMaxDeformation = 0.50f;
 
     std::vector<std::vector<float>> cost(num_trk, std::vector<float>(num_det));
     for (size_t t = 0; t < num_trk; ++t) {

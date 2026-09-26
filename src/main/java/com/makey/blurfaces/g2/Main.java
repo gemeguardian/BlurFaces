@@ -1410,6 +1410,8 @@ public final class Main {
                     : NativeBridge.processDebug(frame.rgba, CleanFrameTap.SIZE, CleanFrameTap.SIZE,
                             outGeometry, outScores, outYaws, MAX_FACES, confidence, debugSnapshot);
             long resultNanos = System.nanoTime();
+            // Overlapped a tracker reset (camera switch, reconfigure): stale by definition.
+            if (count == NativeBridge.STALE_AFTER_RESET) return;
 
             FaceGeometry detections = new FaceGeometry(outGeometry, outScores, outYaws, count,
                     frame.captureNanos, frame.sourceKey);
