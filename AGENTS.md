@@ -1,4 +1,4 @@
-# Blur Faces v3.0.0 — Agent Instructions & Repository Guidelines
+# Blur Faces v1.0.0 — Agent Instructions & Repository Guidelines
 
 This document provides instructions for agents and developers working on the `blur-faces` plugin repository.
 
@@ -24,6 +24,7 @@ This document provides instructions for agents and developers working on the `bl
 4. **Zero Lingering Blur on Camera Flip / New Session**:
    - Camera switch barrier is `CAMERA_SWITCH_BARRIER_MIN_FRAMES` frames.
    - `activateSource()` must call `noteCameraSwitch()` on **every** source activation (not only flips): it resets the native ByteTracker, whose lost tracks age by detector frame count rather than wall time, and calls `CleanFrameTap.resetPbo()` to flush pending async buffers.
+   - `NativeBridge.reset()` is lock-free (it runs on the GL/UI thread): it only bumps a reset generation that the inference worker applies before its next tracker update. A frame whose inference overlapped a reset returns `STALE_AFTER_RESET` (-6) and is dropped. Lost tracks stay re-identifiable for `ByteTracker::kMaxTimeLostFrames` (8 detector frames ≈ 1 s).
 
 5. **False-Positive Suppression (current implementation)**:
    - The detector is a learned model; there are no hand-written skin/texture/colour filters anymore (they were removed together with the anchor-based model in `f2f0187`). Do not re-document them without re-adding them.
@@ -40,7 +41,6 @@ This document provides instructions for agents and developers working on the `bl
 ├── build.gradle / gradlew        # Java / DEX build configuration
 ├── build.sh                      # Unified build script (NDK + Gradle + elyb)
 ├── build.py                      # Asset validation, staging & hash generator
-├── HANDOFF.md                    # Architecture handoff documentation
 ├── README.md                     # Project overview and quickstart
 ├── src/                          # Native C++ & Java source code
 │   ├── head_detector.cpp/.h      # NCNN inference & multi-cue filters
@@ -74,7 +74,7 @@ The script automatically detects or accepts:
 - `ANDROID_NDK_ROOT` or `NDK_PATH` (path to Android NDK)
 
 The output installable artifact is generated at:
-`builds/blur_faces-3.0.0.elyx`
+`builds/blur_faces-1.0.0.elyx`
 
 ## Verification & Testing
 
