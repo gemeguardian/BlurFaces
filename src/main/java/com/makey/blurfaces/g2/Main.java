@@ -268,7 +268,7 @@ public final class Main {
     public static void setRoundVideoResolution(String value) {
         int parsed;
         try { parsed = Integer.parseInt(value); }
-        catch (Throwable ignored) { parsed = 0; }
+        catch (NumberFormatException invalid) { parsed = 0; }
         if (parsed != 0 && parsed != 320 && parsed != 384 && parsed != 448 && parsed != 512) parsed = 0;
         roundVideoResolutionOverride = parsed;
         emit(parsed == 0 ? "Round-video resolution follows exteraGram"
@@ -277,14 +277,14 @@ public final class Main {
     public static void setFaceMaskScale(String value) {
         int parsed;
         try { parsed = Integer.parseInt(value); }
-        catch (Throwable ignored) { parsed = 100; }
+        catch (NumberFormatException invalid) { parsed = 100; }
         if (parsed != 65 && parsed != 82 && parsed != 100) parsed = 82;
         faceMaskScale = parsed / 100.0f;
         emit("Face mask scale set to " + parsed + "%");
     }
     public static void setMaskMode(String value) {
         int parsed;
-        try { parsed = Integer.parseInt(value); } catch (Throwable ignored) { parsed = 0; }
+        try { parsed = Integer.parseInt(value); } catch (NumberFormatException invalid) { parsed = 0; }
         maskMode = parsed == 1 || parsed == 2 ? parsed : 0;
         emit("Mask mode set to " + (maskMode == 1 ? "pixelate" : maskMode == 2 ? "solid" : "blur"));
     }
@@ -295,7 +295,8 @@ public final class Main {
         return "state=" + protectionState + ", captured=" + framesCaptured + ", processed=" + processed
                 + ", dropped=" + framesDropped + ", inferenceMs=" + average
                 + ", staleP50=" + stalenessPercentile(50) + ", staleP95=" + stalenessPercentile(95)
-                + ", leaks=" + maskLeakFrames;
+                + ", leaks=" + maskLeakFrames
+                + (MISSING_HOOKS.isEmpty() ? "" : ", missingHooks=" + MISSING_HOOKS);
     }
 
     public static String runPrivacySelfTest() {
@@ -589,11 +590,53 @@ public final class Main {
     }
     private static void emit(String message) {
         Log.i(TAG, message);
-        if (logger != null) try { logger.accept("[BlurFaces] " + message); } catch (Throwable ignored) { }
+        forwardToHost("[BlurFaces] " + message);
     }
     private static void emit(String message, Throwable error) {
         Log.e(TAG, message, error);
-        if (logger != null) try { logger.accept("[BlurFaces] " + message + ": " + error); } catch (Throwable ignored) { }
+        forwardToHost("[BlurFaces] " + message + ": " + error);
+    }
+    private static void forwardToHost(String line) {
+        Consumer<String> sink = logger;
+        if (sink == null) return;
+        // The host log sink is a Python callback; its failure must not break a
+        // camera frame, and logging it through emit() would recurse.
+        try { sink.accept(line); } catch (RuntimeException error) { Log.w(TAG, "Host logger rejected a line", error); }
+    }
+
+    // Reflection into exteraGram internals legitimately fails on other client
+    // builds and falls back. Those sites run per frame, so each one is reported
+    // exactly once (logcat + host log) instead of being swallowed silently.
+    private static final java.util.Set<String> REPORTED_FALLBACKS = ConcurrentHashMap.newKeySet();
+    private static final List<String> MISSING_HOOKS = new java.util.concurrent.CopyOnWriteArrayList<>();
+
+    private static void warnOnce(String site, Throwable error) {
+        if (!REPORTED_FALLBACKS.add(site)) return;
+        Log.w(TAG, site + " unavailable; using fallback", error);
+        forwardToHost("[BlurFaces] " + site + " unavailable; using fallback"
+                + (error == null ? "" : ": " + error));
+    }
+
+    @FunctionalInterface
+    private interface HookInstaller { void install() throws Exception; }
+
+    /** Installs a hook whose absence on this client build is survivable; reports it once if missing. */
+    private static boolean hookOptional(String name, HookInstaller installer) {
+        try {
+            installer.install();
+            return true;
+        } catch (Exception | LinkageError error) {
+            MISSING_HOOKS.add(name);
+            warnOnce("Hook " + name, error);
+            return false;
+        }
+    }
+
+    /** Reads a host field, or null when this client build does not have it. */
+    private static Object fieldValueOrNull(Object target, String name) {
+        if (target == null) return null;
+        try { return field(target.getClass(), name).get(target); }
+        catch (NoSuchFieldException | IllegalAccessException error) { return null; }
     }
 
     public static synchronized void initAndStart(String modelPath, String confidenceValue,
@@ -667,7 +710,7 @@ public final class Main {
         try {
             raw = Float.parseFloat(value);
             if (raw > 1.0f) raw /= 100.0f;
-        } catch (Throwable ignored) {
+        } catch (NumberFormatException | NullPointerException invalid) {
             raw = 0.45f;
         }
         if (Math.abs(raw - 0.45f) < 0.01f) {
@@ -722,47 +765,25 @@ public final class Main {
                 if (Boolean.TRUE.equals(param.args[0])) installBlurControl(param.thisObject);
             }
         }));
-        try {
-            Method switchCamera = type.getDeclaredMethod("switchCamera");
-            switchCamera.setAccessible(true);
-            HOOKS.add(XposedBridge.hookMethod(switchCamera, new XC_MethodHook() {
-                @Override public void beforeHookedMethod(MethodHookParam param) {
-                    noteCameraSwitch();
-                }
-            }));
-        } catch (Throwable ignored) { }
-        try {
-            Method switchCameraX = type.getDeclaredMethod("switchCameraX");
-            switchCameraX.setAccessible(true);
-            HOOKS.add(XposedBridge.hookMethod(switchCameraX, new XC_MethodHook() {
-                @Override public void beforeHookedMethod(MethodHookParam param) {
-                    noteCameraSwitch();
-                }
-            }));
-        } catch (Throwable ignored) { }
-        try {
-            Class<?> cxSession = Class.forName(
-                    "com.exteragram.messenger.camera.CameraXSession", false, Main.class.getClassLoader());
-            Method switchCamera = cxSession.getDeclaredMethod("switchCamera");
-            switchCamera.setAccessible(true);
-            HOOKS.add(XposedBridge.hookMethod(switchCamera, new XC_MethodHook() {
-                @Override public void beforeHookedMethod(MethodHookParam param) {
-                    noteCameraSwitch();
-                }
-            }));
-        } catch (Throwable ignored) { }
-        try {
-            Class<?> cv = Class.forName(
-                    "org.telegram.messenger.camera.CameraView", false, Main.class.getClassLoader());
-            Method switchCamera = cv.getDeclaredMethod("switchCamera");
-            switchCamera.setAccessible(true);
-            HOOKS.add(XposedBridge.hookMethod(switchCamera, new XC_MethodHook() {
-                @Override public void beforeHookedMethod(MethodHookParam param) {
-                    noteCameraSwitch();
-                }
-            }));
-        } catch (Throwable ignored) { }
-        try {
+        // Camera flips are hooked wherever this client build exposes them. Each one
+        // is optional: activateSource() also resets on every new camera source, so
+        // a missing hook degrades flip latency, not coverage.
+        ClassLoader loader = Main.class.getClassLoader();
+        boolean anySwitchHook = false;
+        anySwitchHook |= hookOptional("InstantCameraView.switchCamera",
+                () -> hookCameraSwitch(type.getDeclaredMethod("switchCamera")));
+        anySwitchHook |= hookOptional("InstantCameraView.switchCameraX",
+                () -> hookCameraSwitch(type.getDeclaredMethod("switchCameraX")));
+        anySwitchHook |= hookOptional("CameraXSession.switchCamera",
+                () -> hookCameraSwitch(Class.forName("com.exteragram.messenger.camera.CameraXSession", false, loader)
+                        .getDeclaredMethod("switchCamera")));
+        anySwitchHook |= hookOptional("CameraView.switchCamera",
+                () -> hookCameraSwitch(Class.forName("org.telegram.messenger.camera.CameraView", false, loader)
+                        .getDeclaredMethod("switchCamera")));
+        if (!anySwitchHook) {
+            emit("No camera-switch hook matched this client; relying on source-change reset only");
+        }
+        hookOptional("InstantCameraView.setButtonsBackground", () -> {
             Class<?> factoryType = Class.forName(
                     "org.telegram.ui.Components.blur3.BlurredBackgroundDrawableViewFactory",
                     false, Main.class.getClassLoader());
@@ -781,8 +802,15 @@ public final class Main {
                     }
                 }
             }));
-        } catch (Throwable ignored) { }
+        });
         emit("Round-camera blur toggle ready");
+    }
+
+    private static void hookCameraSwitch(Method method) {
+        method.setAccessible(true);
+        HOOKS.add(XposedBridge.hookMethod(method, new XC_MethodHook() {
+            @Override public void beforeHookedMethod(MethodHookParam param) { noteCameraSwitch(); }
+        }));
     }
 
     private static void installBlurControl(Object cameraView) {
@@ -798,10 +826,8 @@ public final class Main {
             if (!(cameraView instanceof FrameLayout)) return;
             Method getZoomSlider = cameraView.getClass().getMethod("getZoomSlider");
             View zoomSlider = (View) getZoomSlider.invoke(cameraView);
-            View cameraContainer = null;
-            try {
-                cameraContainer = (View) field(cameraView.getClass(), "cameraContainer").get(cameraView);
-            } catch (Throwable ignored) { }
+            View cameraContainer = (View) fieldValueOrNull(cameraView, "cameraContainer");
+            if (cameraContainer == null) warnOnce("InstantCameraView.cameraContainer", null);
             Theme.ResourcesProvider resourcesProvider =
                     (Theme.ResourcesProvider) field(cameraView.getClass(), "resourcesProvider").get(cameraView);
             BlurControl control = new BlurControl(
@@ -824,7 +850,9 @@ public final class Main {
                         control.setBlurBackground(factory, colorProvider);
                     }
                 }
-            } catch (Throwable ignored) { }
+            } catch (Exception | LinkageError error) {
+                warnOnce("Blurred camera-button background", error); // plain pill is used instead
+            }
             synchronized (BLUR_CONTROLS) { BLUR_CONTROLS.put(cameraView, control); }
             // Privacy-first default for every newly opened round camera.
             setBlurEnabled(true);
@@ -927,48 +955,39 @@ public final class Main {
         HOOKS.add(XposedBridge.hookMethod(finish, new XC_MethodHook() {
             @Override public void beforeHookedMethod(MethodHookParam param) { releaseCameraState(param.thisObject); }
         }));
-        try {
-            Method reinit = type.getDeclaredMethod("reinitForNewCamera");
-            reinit.setAccessible(true);
-            HOOKS.add(XposedBridge.hookMethod(reinit, new XC_MethodHook() {
-                @Override public void beforeHookedMethod(MethodHookParam param) { noteCameraSwitch(); }
-            }));
-        } catch (Throwable ignored) { }
-        try {
-            Method flip = type.getDeclaredMethod("flipSurfaces");
-            flip.setAccessible(true);
-            HOOKS.add(XposedBridge.hookMethod(flip, new XC_MethodHook() {
-                @Override public void beforeHookedMethod(MethodHookParam param) { noteCameraSwitch(); }
-            }));
-        } catch (Throwable ignored) { }
+        hookOptional("CameraGLThread.reinitForNewCamera",
+                () -> hookCameraSwitch(type.getDeclaredMethod("reinitForNewCamera")));
+        hookOptional("CameraGLThread.flipSurfaces",
+                () -> hookCameraSwitch(type.getDeclaredMethod("flipSurfaces")));
     }
 
-    private static void hookEncoderRenderer() {
-        try {
-            Class<?> type = Class.forName(ENCODER_RENDERER, false, Main.class.getClassLoader());
-            Class<?> snapshot;
-            try { snapshot = Class.forName(FRAME_SNAPSHOT, false, type.getClassLoader()); }
-            catch (Throwable ignored) { snapshot = Class.forName(FRAME_SNAPSHOT, false, Main.class.getClassLoader()); }
-            Method created = type.getDeclaredMethod("onEncoderSurfaceCreated", int.class, int.class);
-            Method draw = type.getDeclaredMethod("onDrawEncoderFrame", long.class, snapshot);
-            Method destroyed = type.getDeclaredMethod("onEncoderSurfaceDestroyed");
-            created.setAccessible(true); draw.setAccessible(true); destroyed.setAccessible(true);
-            HOOKS.add(XposedBridge.hookMethod(created, new XC_MethodHook() {
-                @Override public void afterHookedMethod(MethodHookParam p) {
-                    createEncoderState(p.thisObject, (Integer) p.args[0], (Integer) p.args[1]);
-                }
-            }));
-            HOOKS.add(XposedBridge.hookMethod(draw, new XC_MethodHook() {
-                @Override public void beforeHookedMethod(MethodHookParam p) { beforeEncoderDraw(p.thisObject, p.args[1]); }
-                @Override public void afterHookedMethod(MethodHookParam p) { afterEncoderDraw(p.thisObject); }
-            }));
-            HOOKS.add(XposedBridge.hookMethod(destroyed, new XC_MethodHook() {
-                @Override public void beforeHookedMethod(MethodHookParam p) { releaseEncoderState(p.thisObject); }
-            }));
-            emit("Encoder hooks registered: surface create/draw/destroy");
-        } catch (Throwable error) {
-            emit("Encoder blur unavailable; preview remains active and encoder is untouched", error);
+    // Mandatory: without it the preview would look protected while the recorded
+    // round video, the only thing other people receive, is sent unblurred. A
+    // failure here fails initialization visibly instead.
+    private static void hookEncoderRenderer() throws Exception {
+        Class<?> type = Class.forName(ENCODER_RENDERER, false, Main.class.getClassLoader());
+        Class<?> snapshot;
+        try { snapshot = Class.forName(FRAME_SNAPSHOT, false, type.getClassLoader()); }
+        catch (ClassNotFoundException notInRendererLoader) {
+            snapshot = Class.forName(FRAME_SNAPSHOT, false, Main.class.getClassLoader());
         }
+        Method created = type.getDeclaredMethod("onEncoderSurfaceCreated", int.class, int.class);
+        Method draw = type.getDeclaredMethod("onDrawEncoderFrame", long.class, snapshot);
+        Method destroyed = type.getDeclaredMethod("onEncoderSurfaceDestroyed");
+        created.setAccessible(true); draw.setAccessible(true); destroyed.setAccessible(true);
+        HOOKS.add(XposedBridge.hookMethod(created, new XC_MethodHook() {
+            @Override public void afterHookedMethod(MethodHookParam p) {
+                createEncoderState(p.thisObject, (Integer) p.args[0], (Integer) p.args[1]);
+            }
+        }));
+        HOOKS.add(XposedBridge.hookMethod(draw, new XC_MethodHook() {
+            @Override public void beforeHookedMethod(MethodHookParam p) { beforeEncoderDraw(p.thisObject, p.args[1]); }
+            @Override public void afterHookedMethod(MethodHookParam p) { afterEncoderDraw(p.thisObject); }
+        }));
+        HOOKS.add(XposedBridge.hookMethod(destroyed, new XC_MethodHook() {
+            @Override public void beforeHookedMethod(MethodHookParam p) { releaseEncoderState(p.thisObject); }
+        }));
+        emit("Encoder hooks registered: surface create/draw/destroy");
     }
 
     private static void hookEncoderFallback() {
@@ -992,6 +1011,7 @@ public final class Main {
                                 emit("Hardware video encoder failed to create; fell back to CPU OMX.google.h264.encoder");
                                 return;
                             } catch (Throwable t2) {
+                                t2.addSuppressed(t1);
                                 emit("Software video encoder fallback failed", t2);
                             }
                         }
@@ -1131,7 +1151,10 @@ public final class Main {
                 hostTexture.get(tex);
                 return state.tap.renderBlur(textures[slot], mvp, st, tex, null, blurRadiusScale);
             }
-        } catch (Throwable ignored) { }
+        } catch (Exception | LinkageError error) {
+            // Caller covers the frame with the fallback texture and reports DEGRADED.
+            warnOnce("On-demand preview blur", error);
+        }
         return 0;
     }
 
@@ -1186,7 +1209,11 @@ public final class Main {
                         owner = candidate; slot = i; break;
                     }
                     if (owner != null) break;
-                } catch (Throwable ignored) { }
+                } catch (ReflectiveOperationException | ClassCastException error) {
+                    // Without the surface table no frame is read back: the preview
+                    // stays on full-frame blur (no fresh result), never uncovered.
+                    warnOnce("CameraGLThread.cameraSurface", error);
+                }
             }
         }
         // Exact object identity is mandatory; unrelated SurfaceTexture updates never reach readback.
@@ -1889,41 +1916,26 @@ public final class Main {
 
     private static boolean isFrontFacing(Object thread) {
         if (thread == null) return false;
-        try {
-            Object outer = field(thread.getClass(), "this$0").get(thread);
-            if (outer != null) {
-                try {
-                    Field f = field(outer.getClass(), "isFrontface");
-                    if (f != null && f.getType() == boolean.class) {
-                        return f.getBoolean(outer);
-                    }
-                } catch (Throwable ignored) { }
-            }
-        } catch (Throwable ignored) { }
-        try {
-            Field f = field(thread.getClass(), "isFrontface");
-            if (f != null && f.getType() == boolean.class) {
-                return f.getBoolean(thread);
-            }
-        } catch (Throwable ignored) { }
+        Object value = fieldValueOrNull(fieldValueOrNull(thread, "this$0"), "isFrontface");
+        if (!(value instanceof Boolean)) value = fieldValueOrNull(thread, "isFrontface");
+        if (value instanceof Boolean) return (Boolean) value;
+        warnOnce("Camera facing (isFrontface)", null);
         return false;
     }
 
     private static String sourceKey(Object thread, int slot, SurfaceTexture surface) {
+        // Any stable per-camera id works: it only has to change when the camera does.
+        Object value = fieldValueOrNull(thread, "cameraId");
+        if (!(value instanceof Number)) value = fieldValueOrNull(fieldValueOrNull(thread, "this$0"), "cameraId");
         int id = 0;
-        try {
-            Object val = field(thread.getClass(), "cameraId").get(thread);
-            if (val instanceof Number) id = ((Number) val).intValue();
-        } catch (Throwable ignored) {
-            try {
-                Object outer = field(thread.getClass(), "this$0").get(thread);
-                Object val = field(outer.getClass(), "cameraId").get(outer);
-                if (val instanceof Number) id = ((Number) val).intValue();
-            } catch (Throwable ignored2) {
-                try {
-                    int[] generations = (int[]) field(thread.getClass(), "surfaceGeneration").get(thread);
-                    if (generations != null && slot >= 0 && slot < generations.length) id = generations[slot];
-                } catch (Throwable ignored3) { }
+        if (value instanceof Number) {
+            id = ((Number) value).intValue();
+        } else {
+            Object generations = fieldValueOrNull(thread, "surfaceGeneration");
+            if (generations instanceof int[] && slot >= 0 && slot < ((int[]) generations).length) {
+                id = ((int[]) generations)[slot];
+            } else {
+                warnOnce("Camera id (cameraId/surfaceGeneration)", null);
             }
         }
         int hash = surface != null ? System.identityHashCode(surface) : 0;
@@ -1938,7 +1950,11 @@ public final class Main {
             SurfaceTexture[] surfaces = (SurfaceTexture[]) field(thread.getClass(), "cameraSurface").get(thread);
             return surfaces != null && slot >= 0 && slot < surfaces.length && surfaces[slot] != null
                     ? sourceKey(thread, slot, surfaces[slot]) : "";
-        } catch (Throwable ignored) { return ""; }
+        } catch (ReflectiveOperationException | ClassCastException error) {
+            // "" never activates a source: the preview stays on full-frame blur.
+            warnOnce("Current camera source", error);
+            return "";
+        }
     }
 
     static void activateSource(CameraState state, String source, long now) {
@@ -1986,7 +2002,9 @@ public final class Main {
             SOURCE_BY_SLOT.put(slot, source);
             if (textures != null && slot >= 0 && slot < textures.length && textures[slot] > 0)
                 SOURCE_BY_TEXTURE.put(textures[slot], source);
-        } catch (Throwable ignored) { }
+        } catch (ReflectiveOperationException | ClassCastException error) {
+            warnOnce("Encoder source mapping (surfaceIndex/cameraTexture)", error);
+        }
     }
 
     private static Field field(Class<?> type, String name) throws NoSuchFieldException {
@@ -2049,7 +2067,8 @@ public final class Main {
         if (latch != null) {
             try {
                 latch.await(timeoutMs, TimeUnit.MILLISECONDS);
-            } catch (InterruptedException ignored) {
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt(); // let the host thread see it
             }
         }
     }
@@ -2087,12 +2106,16 @@ public final class Main {
         acceptingFrames = false;
         if (debugCapture != null) debugCapture.stop();
         setProtectionState("STOPPING");
-        for (XC_MethodHook.Unhook hook : HOOKS) try { hook.unhook(); } catch (Throwable ignored) { }
+        for (XC_MethodHook.Unhook hook : HOOKS) {
+            try { hook.unhook(); }
+            catch (RuntimeException error) { clean = false; emit("Unhook failed", error); }
+        }
         HOOKS.clear();
         CapturedFrame queued = LATEST_FRAME.getAndSet(null);
         if (queued != null) FRAME_POOL.offer(queued.rgba);
         ExecutorService executor = frameExecutor; frameExecutor = null;
-        try { NativeBridge.cleanup(); } catch (Throwable ignored) { }
+        try { NativeBridge.cleanup(); }
+        catch (RuntimeException | LinkageError error) { clean = false; emit("Native cleanup failed", error); }
         clean &= stopExecutor(executor, "Native input");
         DRAIN_SCHEDULED.set(false);
         clearFirstDetectionLatches();
@@ -2232,7 +2255,9 @@ public final class Main {
                     if (upper.contains("DEFAULT")) return "DEFAULT";
                 }
             }
-        } catch (Throwable ignored) { }
+        } catch (Exception | LinkageError error) {
+            warnOnce("Icon pack via ExteraConfig.getIconPack()", error);
+        }
 
         try {
             Class<?> configClass = Class.forName("com.exteragram.messenger.ExteraConfig", false, Main.class.getClassLoader());
@@ -2244,7 +2269,9 @@ public final class Main {
                 if (name.contains("REMIX")) return "REMIX";
                 if (name.contains("DEFAULT")) return "DEFAULT";
             }
-        } catch (Throwable ignored) { }
+        } catch (Exception | LinkageError error) {
+            warnOnce("Icon pack via reflection", error);
+        }
 
         try {
             Context ctx = ApplicationLoader.applicationContext;
@@ -2260,7 +2287,9 @@ public final class Main {
                     if (lower.contains("remix")) return "REMIX";
                 }
             }
-        } catch (Throwable ignored) { }
+        } catch (RuntimeException error) { // ClassCastException on a differently typed preference
+            warnOnce("Icon pack via exteraconfig preferences", error);
+        }
 
         return "DEFAULT";
     }
@@ -2489,7 +2518,9 @@ public final class Main {
                 try {
                     Method updateColors = blurBackgroundDrawable.getClass().getMethod("updateColors");
                     updateColors.invoke(blurBackgroundDrawable);
-                } catch (Throwable ignored) { }
+                } catch (ReflectiveOperationException error) {
+                    warnOnce("BlurredBackgroundDrawable.updateColors", error);
+                }
             } else {
                 int panel = Theme.getColor(Theme.key_chat_messagePanelBackground, resourcesProvider);
                 int semiTransparent = Theme.multAlpha(panel, 0.78f);
