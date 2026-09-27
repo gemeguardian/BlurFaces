@@ -9,7 +9,7 @@
 ![exteraGram](https://img.shields.io/badge/exteraGram-%E2%89%A5%2012.5.1-2aabee?style=for-the-badge&logo=telegram&logoColor=white)
 ![offline](https://img.shields.io/badge/network-zero-ef4444?style=for-the-badge)
 <br>
-![Code Size](https://img.shields.io/badge/code%20size-508%20KB%20%7C%2011.1k%20LoC-informational.svg)
+![Code Size](https://img.shields.io/badge/code%20size-503%20KB%20%7C%2011.0k%20LoC-informational.svg)
 ![Bundle Size](https://img.shields.io/badge/bundle-7.4%20MB-purple.svg)
 
 </div>
