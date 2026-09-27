@@ -1,5 +1,6 @@
 #include "head_detector.h"
 #include <android/log.h>
+#include <ncnn/cpu.h>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -170,7 +171,9 @@ int HeadDetector::load(const char* param_path, const char* bin_path) {
     clear();
     ncnn::Option opt = net_.opt;
     opt.use_vulkan_compute = false;
-    opt.num_threads = 2;
+    // Two workers on the big cluster (affinity is set on the inference thread,
+    // see process_frame). A single big core (rare) must not be oversubscribed.
+    opt.num_threads = std::clamp(ncnn::get_big_cpu_count(), 1, 2);
     opt.use_fp16_packed = true;
     opt.use_fp16_storage = true;
     opt.use_fp16_arithmetic = true;

@@ -21,7 +21,8 @@ struct KalmanState1D {
     float p11 = 1.0f;
 
     void init(float init_x, float init_v, float std_p0, float std_p1);
-    void predict(float q00, float q01, float q10, float q11);
+    // s: step length in reference frames (1 = the tuned ~130 ms cadence).
+    void predict(float q00, float q01, float q10, float q11, float s = 1.0f);
     void update(float measurement, float r);
 
     float innovation_var(float r) const { return p00 + r; }
@@ -35,14 +36,24 @@ class STrack {
 public:
     STrack();
     STrack(const HeadBox& box, int track_id);
-    STrack(const HeadBox& box, int track_id, float neutral_score);
+    // frame_scale: this detector frame's weight in reference frames (see
+    // ByteTracker::kReferenceFrameMs); 1 at the cadence the constants were tuned at.
+    STrack(const HeadBox& box, int track_id, float neutral_score, float frame_scale = 1.0f);
     ~STrack() = default;
 
-    void predict();
+    // motion_scale: time since the previous prediction in reference frames (not
+    // capped at 1, unlike evidence). camera_dx/dy: global image shift since the
+    // previous detector frame in normalised coordinates (camera motion compensation).
+    void predict(float motion_scale = 1.0f, float camera_dx = 0.0f, float camera_dy = 0.0f);
     void update(const HeadBox& box, int frame_id);
     void update(const HeadBox& box, int frame_id, float iou);
-    void update(const HeadBox& box, int frame_id, float iou, float neutral_score);
-    void mark_lost();
+    // strong: the detection scored >= high_threshold (stage 1).
+    void update(const HeadBox& box, int frame_id, float iou, float neutral_score,
+                float frame_scale = 1.0f, bool strong = true);
+    void mark_lost(float frame_scale = 1.0f);
+    // An unconfirmed candidate missed this frame: ages it without evidence decay
+    // (the gap length itself is bounded by ByteTracker).
+    void note_gap(float frame_scale);
     void mark_removed();
     void activate(int frame_id);
     // Whether the renderer may draw this track right now (confirmed, and if lost,
@@ -53,6 +64,12 @@ public:
     TrackState state() const { return state_; }
     int frames_lost() const { return frames_lost_; }
     int frames_tracked() const { return frames_tracked_; }
+    // Observed / missed time in reference frames; equal to the frame counts at
+    // the reference cadence. Coasting and lost-track policies use these.
+    float tracked_age() const { return tracked_age_; }
+    float lost_age() const { return lost_age_; }
+    // Observed time with detections >= high_threshold, in reference frames.
+    float strong_age() const { return strong_age_; }
     float score() const { return score_; }
     bool is_activated() const { return is_activated_; }
     float log_odds() const { return log_odds_; }
@@ -69,7 +86,10 @@ public:
     // Every observation adds evidence = logit(score) - logit(neutral), where
     // neutral is the midpoint of the tracker's low/high thresholds, so scores at
     // the band centre are uninformative, high scores count for, low scores count
-    // against. The per-frame contribution is capped, so no single frame confirms
+    // against. Exception: stage-2 (below high) matches of a young track, with
+    // less than 6 reference frames of strong observations, use neutral = high,
+    // so they can only drain it (see ByteTracker::update). Evidence is weighted
+    // by the frame's duration in reference frames (ByteTracker::frame_scale). The per-frame contribution is capped, so no single frame confirms
     // a track on its own, and scaled by size reliability: at 192 px capture a
     // 10%-wide head is ~19 px, where YOLOv8n is least trustworthy (device trace
     // 2026-09-22: a backpack scored 0.71/0.45/0.42 in a 10%x9% box), so tiny
@@ -94,9 +114,9 @@ public:
     // Hit-count floor on top of SPRT; the evidence cap already guarantees >= 2.
     static constexpr int kMinHits = 2;
     // Lost tracks are only coasted to the renderer when they were observed long
-    // enough to be trusted, and only briefly: the detector runs at ~7-8 fps on
-    // device, so every coasted frame costs ~130 ms of ghost blur. The Java layer
-    // adds its own hold on top.
+    // enough to be trusted, and only briefly: each reference frame of coasting
+    // costs ~130 ms of ghost blur. Both are in reference frames (tracked_age /
+    // lost_age), not raw detector frames. The Java layer adds its own hold on top.
     static constexpr int kMinHitsForCoast = 6;
     static constexpr int kMaxCoastPublishFrames = 4;
 
@@ -108,6 +128,9 @@ private:
     float score_ = 0.0f;
     bool is_activated_ = false;
     float log_odds_ = 0.0f; // Sequential Probability Ratio Test (SPRT) Log-Odds
+    float tracked_age_ = 0.0f;
+    float lost_age_ = 0.0f;
+    float strong_age_ = 0.0f;
 
     // 4 decoupled Kalman filters: cx, cy, aspect_ratio (w/h), h
     KalmanState1D kf_cx_;
@@ -121,11 +144,25 @@ private:
 class ByteTracker {
 public:
     // How long an established lost track stays re-identifiable (it is published
-    // for at most STrack::kMaxCoastPublishFrames of these). Counted in detector
-    // frames, not camera frames: upstream ByteTrack's 30 assumes 30 fps, which at
-    // the measured 7-8 detector fps kept ghosts re-identifiable for ~4 s. 8 frames
-    // is the intended ~1 s.
+    // for at most STrack::kMaxCoastPublishFrames of these). Counted in reference
+    // frames (lost_age; one per detector frame at or below ~7-8 fps), not camera
+    // frames: upstream ByteTrack's 30 assumes 30 fps, which kept ghosts
+    // re-identifiable for ~4 s. 8 is the intended ~1 s.
     static constexpr int kMaxTimeLostFrames = 8;
+
+    // All frame-denominated constants (SPRT evidence per frame, coast and
+    // lost-track windows) were tuned at ~7-8 detector fps. On a faster device
+    // (measured 2026-09-26: ~24 fps, 7-50 ms inference) consecutive frames are
+    // near-duplicates, and counting each as an independent observation let
+    // dumbbells and clutter confirm in ~100 ms. Each frame is therefore weighted
+    // by dt / kReferenceFrameMs, capped at 1 so slow devices behave as tuned.
+    static constexpr float kReferenceFrameMs = 130.0f;
+    static constexpr float kMinFrameScale = 0.1f;
+    static float frame_scale(float frame_dt_ms);
+    // Kalman prediction is scaled by the real interval (a slow device's head
+    // really moves for the whole ~250-400 ms), up to this many reference frames.
+    static constexpr float kMaxMotionScale = 4.0f;
+    static float motion_scale(float frame_dt_ms);
 
     ByteTracker(float high_threshold = 0.45f,
                 float low_threshold = 0.20f,
@@ -136,7 +173,9 @@ public:
     // Updates tracks with new detections and returns active confirmed tracks for rendering
     std::vector<STrack> update(const std::vector<HeadBox>& detections);
     std::vector<STrack> update(const std::vector<HeadBox>& detections,
-                               float high_threshold, float low_threshold, float instant_threshold);
+                               float high_threshold, float low_threshold, float instant_threshold,
+                               float frame_dt_ms = kReferenceFrameMs,
+                               float camera_dx = 0.0f, float camera_dy = 0.0f);
     void reset();
 
 private:
@@ -157,7 +196,8 @@ private:
                            float threshold,
                            std::vector<std::pair<int, int>>& matches,
                            std::vector<int>& unmatched_tracks,
-                           std::vector<int>& unmatched_detections);
+                           std::vector<int>& unmatched_detections,
+                           bool kinematic_fallback = false);
 };
 
 #endif // BYTETRACK_H

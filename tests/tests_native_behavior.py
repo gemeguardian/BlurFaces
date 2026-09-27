@@ -21,7 +21,8 @@ class NativeBehaviorTest(unittest.TestCase):
                 "-I" + str(ROOT / "src"),
                 "-I" + str(ROOT / "ncnn-prebuilt/arm64-v8a/include"),
                 str(ROOT / "tests/native_tracking_test.cpp"),
-                str(ROOT / "src/bytetrack.cpp"), "-o", str(executable),
+                str(ROOT / "src/bytetrack.cpp"),
+                str(ROOT / "src/camera_motion.cpp"), "-o", str(executable),
             ]
             subprocess.run(command, check=True)
             subprocess.run([str(executable)], check=True)

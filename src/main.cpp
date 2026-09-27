@@ -2,6 +2,7 @@
 #include <android/log.h>
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -12,6 +13,8 @@
 #include "blur_faces.h"
 #include "head_detector.h"
 #include "bytetrack.h"
+#include "camera_motion.h"
+#include <ncnn/cpu.h>
 #include "detection_result.h"
 #include "debug_snapshot.h"
 
@@ -31,6 +34,18 @@ static std::mutex g_engine_mutex;
 // generation the tracker state belongs to and is guarded by g_engine_mutex.
 static std::atomic<uint32_t> g_reset_generation{0};
 static uint32_t g_tracker_generation = 0;
+// Monotonic start time of the previous tracker update (0 = none since the last
+// tracker reset); guarded by g_engine_mutex. Its spacing weights each frame's
+// tracking evidence, see ByteTracker::kReferenceFrameMs.
+static int64_t g_last_tracker_frame_ns = 0;
+// Global image shift between consecutive tracker updates (camera motion
+// compensation); reset together with the tracker. Guarded by g_engine_mutex.
+static CameraMotionEstimator g_camera_motion;
+
+static int64_t monotonic_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 
 // Detections from a frame whose inference overlapped a reset are dropped
 // without advancing the tracker. Negative, so Java never reads it as "no heads".
@@ -71,6 +86,8 @@ int blur_faces_init(const char* param_path, const char* bin_path) {
     }
     g_tracker->reset();
     g_tracker_generation = g_reset_generation.load(std::memory_order_acquire);
+    g_last_tracker_frame_ns = 0;
+    g_camera_motion.reset();
     LOGI("HeadDetector + ByteTrack initialized successfully");
     return 0;
 }
@@ -117,11 +134,31 @@ static jint process_frame(JNIEnv* env, jobject rgba_buf, jint width, jint height
         LOGE("Engine not initialized");
         return -1;
     }
+    // Pin inference to the big cores. On big.LITTLE SoCs the scheduler otherwise
+    // often leaves a background worker on the little cluster, which is the
+    // difference between ~8 and ~3 detector fps on budget phones. Done here, on
+    // the plugin's dedicated inference thread, never in init(): ncnn applies the
+    // affinity to the calling thread, and init() runs on a host-app thread.
+    static thread_local bool t_affinity_applied = false;
+    if (!t_affinity_applied) {
+        t_affinity_applied = true;
+        int ret = ncnn::set_cpu_powersave(2);
+        LOGI("inference affinity: big cores (%d big / %d little), ret=%d",
+             ncnn::get_big_cpu_count(), ncnn::get_little_cpu_count(), ret);
+    }
     const uint32_t generation = g_reset_generation.load(std::memory_order_acquire);
     if (generation != g_tracker_generation) {
         g_tracker->reset();
         g_tracker_generation = generation;
+        g_last_tracker_frame_ns = 0;
+        g_camera_motion.reset();
     }
+    // Spacing between detector frames (includes dropped frames: evidence is per
+    // processed frame). The first frame after a reset counts as one reference frame.
+    const int64_t frame_start_ns = monotonic_ns();
+    const float frame_dt_ms = g_last_tracker_frame_ns > 0
+            ? static_cast<float>(frame_start_ns - g_last_tracker_frame_ns) / 1.0e6f
+            : ByteTracker::kReferenceFrameMs;
 
     // Map min_confidence to ByteTrack thresholds for YOLOv8
     float min_conf = static_cast<float>(min_confidence);
@@ -167,9 +204,18 @@ static jint process_frame(JNIEnv* env, jobject rgba_buf, jint width, jint height
     }
 
     // Preserve native failures all the way to Java's full-frame fallback.
+    // Estimated only for frames that reach the tracker, so the shift always spans
+    // exactly the interval between two tracker updates.
+    float camera_dx = 0.0f, camera_dy = 0.0f;
+    if (status >= 0) g_camera_motion.estimate(pixels, width, height, camera_dx, camera_dy);
     std::vector<STrack> active_tracks;
     int count = update_detection_result(status, detected_heads, *g_tracker,
-            high_thresh, low_thresh, instant_thresh, max_faces, active_tracks);
+            high_thresh, low_thresh, instant_thresh, max_faces, active_tracks, frame_dt_ms,
+            camera_dx, camera_dy);
+    // Errors (-1..-4) reset the tracker; overflow (-5) does not.
+    const bool tracker_was_reset = count < 0 && count != -5;
+    g_last_tracker_frame_ns = tracker_was_reset ? 0 : frame_start_ns;
+    if (tracker_was_reset) g_camera_motion.reset();
     if (debug) {
         auto snapshot = debug_snapshot(status, high_thresh, low_thresh, instant_thresh,
                 scene_lum, g_detector->last_mean_lum(), detected_heads, active_tracks);

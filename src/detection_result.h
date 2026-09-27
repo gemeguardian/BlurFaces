@@ -7,7 +7,9 @@
 inline int update_detection_result(int status, const std::vector<HeadBox>& heads,
                                    ByteTracker& tracker, float high, float low,
                                    float instant, int capacity,
-                                   std::vector<STrack>& output) {
+                                   std::vector<STrack>& output,
+                                   float frame_dt_ms = ByteTracker::kReferenceFrameMs,
+                                   float camera_dx = 0.0f, float camera_dy = 0.0f) {
     output.clear();
     if (status < 0) {
         tracker.reset();
@@ -17,7 +19,7 @@ inline int update_detection_result(int status, const std::vector<HeadBox>& heads
         tracker.reset();
         return -4;
     }
-    output = tracker.update(heads, high, low, instant);
+    output = tracker.update(heads, high, low, instant, frame_dt_ms, camera_dx, camera_dy);
     if (static_cast<int>(output.size()) > capacity) {
         output.clear();
         return -5; // Full-frame protection rather than silently dropping heads.
