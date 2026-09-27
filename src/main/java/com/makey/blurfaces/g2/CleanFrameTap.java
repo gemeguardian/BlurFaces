@@ -337,6 +337,7 @@ final class CleanFrameTap {
         while (GLES20.glGetError() != GLES20.GL_NO_ERROR) { }
     }
 
+    /** GL thread only (the PBO fields are unsynchronised); see Main.applyPendingReset(). */
     void resetPbo() {
         pboPrimed = false;
         pboIndex = 0;

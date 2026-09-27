@@ -919,28 +919,44 @@ public final class Main {
             releaseFirstDetectionLatch(stale.sourceKey);
         }
         clearFirstDetectionLatches();
+        // Render state belongs to each state's GL thread, while this runs on the
+        // UI/hook thread or another camera's GL thread. Mutating it here raced the
+        // draw in progress (e.g. zeroing state.faces mid-upload). Each GL thread
+        // applies the reset at its next entry point, see applyPendingReset().
+        // Fail-closed meanwhile: SOURCE_TRACKS is cleared and LAST_CAMERA_SWITCH
+        // gates every result, so no stale geometry can be drawn.
         synchronized (CAMERA_STATES) {
             for (CameraState state : CAMERA_STATES.values()) {
-                if (blurEnabled) {
-                    state.faceCount = -1;
-                    state.blurTexture = 0;
-                    java.util.Arrays.fill(state.faces, 0f);
-                    state.currFlowGray = null;
-                    state.prevFlowGray = null;
-                    if (state.tap != null) state.tap.resetPbo();
-                }
+                if (blurEnabled) state.resetPending = true;
             }
         }
         synchronized (ENCODER_STATES) {
             for (EncoderState state : ENCODER_STATES.values()) {
-                if (blurEnabled) {
-                    state.faceCount = -1;
-                    state.blurTexture = 0;
-                    java.util.Arrays.fill(state.faces, 0f);
-                    if (state.tap != null) state.tap.resetPbo();
-                }
+                if (blurEnabled) state.resetPending = true;
             }
         }
+    }
+
+    /** GL thread only: applies a reset requested by noteCameraSwitch(). */
+    private static void applyPendingReset(CameraState state) {
+        if (!state.resetPending) return;
+        state.resetPending = false;
+        state.faceCount = -1;
+        state.blurTexture = 0;
+        java.util.Arrays.fill(state.faces, 0f);
+        state.currFlowGray = null;
+        state.prevFlowGray = null;
+        if (state.tap != null) state.tap.resetPbo();
+    }
+
+    /** GL thread only: applies a reset requested by noteCameraSwitch(). */
+    private static void applyPendingReset(EncoderState state) {
+        if (!state.resetPending) return;
+        state.resetPending = false;
+        state.faceCount = -1;
+        state.blurTexture = 0;
+        java.util.Arrays.fill(state.faces, 0f);
+        if (state.tap != null) state.tap.resetPbo();
     }
 
     private static void hookCameraRenderer() throws Exception {
@@ -1027,6 +1043,7 @@ public final class Main {
     private static void beforePreviewDraw(Object thread) {
         if (!acceptingFrames || !blurEnabled) return;
         CameraState state = cameraState(thread);
+        applyPendingReset(state);
         try {
             if (EGL14.eglGetCurrentContext() == EGL14.EGL_NO_CONTEXT) return;
             ensurePreviewProgram(state);
@@ -1223,6 +1240,7 @@ public final class Main {
 
     private static void captureUpdatedSurface(Object thread, SurfaceTexture surface, int slot) {
         CameraState state = cameraState(thread);
+        applyPendingReset(state);
         long now = System.nanoTime();
         ByteBuffer frameBuffer = null;
         String source = null;
@@ -1585,6 +1603,7 @@ public final class Main {
 
     private static void beforeEncoderDraw(Object renderer, Object snapshot) {
         EncoderState state = encoderState(renderer);
+        applyPendingReset(state);
         if (!acceptingFrames || !blurEnabled || !state.ready || snapshot == null) {
             if (blurEnabled && snapshot != null) {
                 setProtectionState("DEGRADED");
@@ -1968,6 +1987,8 @@ public final class Main {
         // next one and was re-identified with the first clutter detection (device
         // logs 2026-09-22: "[Face #3]" spanning two sessions 54 s apart).
         noteCameraSwitch(now);
+        // Already on this state's GL thread: reset directly (same as applyPendingReset).
+        state.resetPending = false;
         state.faceCount = -1;
         state.blurTexture = 0;
         java.util.Arrays.fill(state.faces, 0f);
@@ -2171,6 +2192,8 @@ public final class Main {
         int savedProgram, savedPosition, savedTexture, savedMvp, savedSt, blurTexture, savedBlurBinding;
         int fallbackProgram, fallbackPosition, fallbackMvp, fallbackTexture;
         boolean swapActive, blurBindingActive, pipelineLogged; long lastCaptureNanos, lastReadbackNanos;
+        // Set by noteCameraSwitch() on any thread, applied on this state's GL thread.
+        volatile boolean resetPending;
         long captureIntervalNanos = CAPTURE_INTERVAL_NS; ByteBuffer readPixels; String activeSource;
         final SparseLucasKanadeTracker flowTracker = new SparseLucasKanadeTracker();
         float[] prevFlowGray = new float[CleanFrameTap.SIZE * CleanFrameTap.SIZE];
@@ -2562,6 +2585,8 @@ public final class Main {
         int savedMvp, savedSt, savedTexel;
         int fallbackProgram, fallbackPosition, fallbackMvp, fallbackTexture;
         boolean ready, swapActive, activeLogged, blurBindingActive, pipelineLogged;
+        // Set by noteCameraSwitch() on any thread, applied on this state's GL thread.
+        volatile boolean resetPending;
 
         int fallbackTexture() {
             if (fallbackTexture != 0) return fallbackTexture;
